@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  theo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./src:/app/src
+      - ./src/theo:/app/src/theo
+      - ./entrypoint.sh:/app/entrypoint.sh
+      - ./.env:/app/.env
+    environment:
+      - PYTHONPATH=/app/src
+      # Add any other env vars you want to override here
+    ports:
+      - "8000:8000"
+    command: ddtrace-run uvicorn src.theo.api:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env 

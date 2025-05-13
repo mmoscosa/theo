@@ -1,0 +1,171 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Theo / Cursor Agent System Rules & Context
+
+---
+
+## 🔑 Core Rules & Config
+
+1. **Load-only `.env`**  
+   - All secrets, API keys, model names, IDs, and user handles come exclusively from environment variables.  
+   - **Never** hard-code or override any value present in `.env`.
+
+2. **Prevent Hallucinations**  
+   - Always adhere to the documented system architecture, agent names, and data flows.  
+   - If uncertain, ask for clarification instead of inventing details.
+
+3. **Audit Trail & Observability**  
+   - Persist every incoming message, outgoing reply, and handoff in your audit store.  
+   - Emit latency, success/fail, and handoff‑count metrics/traces to Datadog LLM Observability.
+   - Make sure you are using DataDog official documentation for LLM Observability https://docs.datadoghq.com/llm_observability/
+
+4. **Vector-Search Knowledge Bases**  
+   - All reads/writes go to AWS Bedrock in **us-east-1**.  
+   - Collections in sentenceCase:
+     - **CodeDocumentation**  
+     - **DbSchemaAndQueries**  
+     - **GeneralKnowledge**
+
+---
+
+## 📝 LLM API Keys
+
+Define all your LLM provider credentials at the top of your `.env`:
+
+```dotenv
+# ─── LLM API Keys ───────────────────────────────────────────────────────────
+OPENAI_API_KEY=                           # from https://platform.openai.com/account/api-keys
+ANTHROPIC_API_KEY=                        # from https://console.anthropic.com/account/api-keys
+GOOGLE_APPLICATION_CREDENTIALS=           # path to your GCP service-account JSON
+GOOGLE_API_KEY=                           # optional, if using simple API key
+AWS_ACCESS_KEY_ID=                        # for AWS Bedrock access
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=                        # optional, for temporary AWS creds
+```
+
+---
+
+## 🏗 Application Overview
+
+- Scaffold a **Python** (FastAPI) service deployed on AWS that uses the **Crew.ai CLI** to orchestrate five agents.
+- Agents:
+  - **Supervisor** (`gpt-4o`)
+  - **Support Engineer** (`gpt-4o` + image analysis via Gemini)
+  - **Technical Writer** (`claude-3-5-sonnet-20240620`)
+  - **BI Engineer** (`claude-3-5-sonnet-20240620`)
+  - **Product Manager** (`gpt-4o`)
+
+---
+
+## 🔌 Integrations
+
+### Environment Variables (`.env.example`)
+```dotenv
+# ─── LLM API Keys ───────────────────────────────────────────────────────────
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GOOGLE_API_KEY=
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+
+# ─── Datadog Configuration ──────────────────────────────────────────────────
+DD_API_KEY=
+DD_SITE=datadoghq.com
+DD_LLMOBS_ENABLED=1
+DD_LLMOBS_ML_APP=
+DD_LLMOBS_AGENTLESS_ENABLED=1
+DD_LLMOBS_INTAKE_URL=
+DD_APPSEC_TELEMETRY_INTAKE_URL=
+DD_TRACE_DEBUG=false
+DD_TRACE_STDOUT=false
+
+# ─── AWS & Bedrock KBs ──────────────────────────────────────────────────────
+AWS_REGION=us-east-1
+BEDROCK_CODE_DOCUMENTATION_KB_ID=
+BEDROCK_DB_SCHEMA_QUERIES_KB_ID=
+BEDROCK_GENERAL_KB_ID=
+
+# ─── Slack ─────────────────────────────────────────────────────────────────
+SLACK_WORKSPACE_DOMAIN=
+SLACK_BOT_TOKEN=
+SLACK_SIGNING_SECRET=
+ADMIN_SLACK_USER_ID=
+SLACK_FALLBACK_CHANNEL_ID=
+SLACK_BOT_USER_ID=
+
+# ─── GitHub ────────────────────────────────────────────────────────────────
+GITHUB_WEBHOOK_SECRET=
+GITHUB_TOKEN=
+TARGET_GITHUB_REPO=
+
+# ─── Jira ──────────────────────────────────────────────────────────────────
+JIRA_BASE_URL=
+JIRA_API_TOKEN=
+JIRA_PROJECT_KEY=
+
+# ─── Confluence ─────────────────────────────────────────────────────────────
+CONFLUENCE_BASE_URL=
+CONFLUENCE_SPACE_KEY=UP
+CONFLUENCE_ADMIN_USER=
+
+# ─── Agent Models ───────────────────────────────────────────────────────────
+AGENT_SUPERVISOR_MODEL=gemini-2.5-pro-preview-05-06
+AGENT_SUPPORT_ENGINEER_MODEL=o3-2025-04-16
+AGENT_TECHNICAL_WRITER_MODEL=claude-3-5-sonnet-20240620
+AGENT_BI_ENGINEER_MODEL=claude-3-5-sonnet-20240620
+AGENT_PRODUCT_MANAGER_MODEL=chatgpt-4o-latest-20250326
+```
+
+---
+
+## 💬 Slack Integration Guidelines
+
+1. **No slash-commands** – Detect keywords in messages directly.  
+2. **Thread-based** – Keep all replies in the same thread.  
+3. **Reactions**:
+   - 🤖 = Request received and being processed  
+   - ⏳ = Processing in progress (remove when done)  
+   - 🌐 = Error occurred (plus apology + `@ADMIN_SLACK_USER_ID` tag)  
+4. **Admin notifications** – Tag `@ADMIN_SLACK_USER_ID` for critical errors or unavailable thread/channel.
+
+### Agent Triggers
+
+- **Supervisor**: Routes based on content; confirms ambiguous commands.  
+- **Support Engineer** – Keywords: `support`, `help`, `question`, `how to`  
+- **Technical Writer** – Keywords: `document`, `docs`, `train`, `update docs`  
+  - Ask for confirmation if ambiguous.  
+- **BI Engineer** – Keywords: `report`, `data`, `analytics`, `metrics`  
+- **Product Manager** – Keywords: `ticket`, `issue`, `create ticket`
+
+---
+
+## 🔗 GitHub Integration
+
+- Handle only **push** events on `refs/heads/main`.  
+- Forward full commit payload to the Technical Writer agent.
+
+---
+
+## 📄 Confluence Structure
+
+- **Space key**: `UP`  
+- Top-level pages: one per domain (Billing, Onboarding, etc.)  
+- Sub-pages under each domain  
+- “Engineering Documentation” ADR page
+
+---
+
+## 📚 Knowledge Base Schemas
+
+**CodeDocumentation**:  
+`docId, title, domain, subdomain, version, author, sourceUrl, content, summary, tags, createdAt, updatedAt, embeddingVector`
+
+**DbSchemaAndQueries**:  
+`recordId, tableName, schemaDefinition, queryId, querySql, description, useCase, performanceMetrics, tags, createdAt, updatedAt, embeddingVector`
+
+**GeneralKnowledge**:  
+`entryId, conversationId, timestamp, agent, snippet, summary, topic, relatedDocs, tags, embeddingVector`

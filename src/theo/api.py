@@ -1,0 +1,239 @@
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+import uvicorn
+import os
+from threading import Lock
+
+# Initialize tracer
+from ddtrace import tracer
+
+from theo.crew import Theo
+from theo.tools.datadog import DatadogClient
+from theo.tools.slack import send_slack_message, add_slack_reaction, remove_slack_reaction, fetch_thread_history
+
+app = FastAPI(title="Theo Crew Orchestrator")
+datadog = DatadogClient()
+
+print("DD_TRACE_AGENTLESS:", os.environ.get("DD_TRACE_AGENTLESS"))
+print("DD_API_KEY:", os.environ.get("DD_API_KEY"))
+print("DD_SITE:", os.environ.get("DD_SITE"))
+print("DD_LLMOBS_ML_APP:", os.environ.get("DD_LLMOBS_ML_APP"))
+
+SLACK_BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID")
+
+concluded_threads = set()
+concluded_threads_lock = Lock()
+processed_messages = set()
+processed_messages_lock = Lock()
+
+def extract_conversation_id(event_type, payload):
+    if event_type == "slack":
+        return payload.get("thread_ts") or payload.get("ts") or payload.get("event_ts")
+    elif event_type == "github":
+        return payload.get("thread_id") or payload.get("issue", {}).get("id") or payload.get("pull_request", {}).get("id")
+    return None
+
+def route_event_to_crew(event_type: str, payload: dict, parent_span=None, thread_history=None):
+    if event_type == "slack" and "event" in payload:
+        event = payload["event"]
+        # Ignore messages sent by the bot itself FIRST
+        if event.get("user") == SLACK_BOT_USER_ID or event.get("bot_id") or event.get("subtype") == "bot_message":
+            print("[DEBUG] Ignoring message from bot itself.")
+            return {"result": "Ignoring bot's own message.", "task": None, "conversation_id": extract_conversation_id(event_type, payload)}
+        # Only respond to app_mention events or messages in a thread
+        if event.get("type") != "app_mention":
+            if event.get("type") == "message" and event.get("thread_ts"):
+                pass  # allow
+            else:
+                print(f"[DEBUG] Ignoring Slack event type: {event.get('type')}")
+                return {"result": f"Ignoring Slack event type: {event.get('type')}", "task": None, "conversation_id": extract_conversation_id(event_type, payload)}
+    if parent_span is not None:
+        span = tracer.start_span("crew.route_event", child_of=parent_span)
+    else:
+        span = tracer.start_span("crew.route_event")
+    with span:
+        user_message = ""
+        if event_type == "slack" and "event" in payload and "text" in payload["event"]:
+            user_message = payload["event"]["text"]
+            mention_str = f"<@{SLACK_BOT_USER_ID}>"
+            thread_ts = payload["event"].get("thread_ts")
+            # Only require mention if not in a thread
+            if not thread_ts and mention_str not in user_message and "@theo" not in user_message.lower():
+                print("[DEBUG] Bot not mentioned, ignoring message.")
+                return {"result": "Bot not mentioned, ignoring message.", "task": None, "conversation_id": extract_conversation_id(event_type, payload)}
+            user_message = user_message.replace(mention_str, "").replace("@theo", "").strip()
+        else:
+            user_message = payload.get("text", "")
+        conversation_id = extract_conversation_id(event_type, payload)
+        theo = Theo()
+        print(f"[DEBUG] Asking Supervisor agent to route message: {user_message}")
+        supervisor_result = theo.supervisor_routing(question=user_message, conversation_id=conversation_id, thread_history=thread_history)
+        print(f"[DEBUG] Supervisor agent LLM output: {supervisor_result}")
+        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "clarification_needed"}
+        # If supervisor_result is a dict, unpack for bi_report or documentation_update
+        if isinstance(supervisor_result, dict):
+            task_name = supervisor_result.get("task_name")
+            print(f"[DEBUG] Task selected by Supervisor (dict): {task_name}")
+            task_fn = getattr(theo, task_name, None)
+            if task_fn and task_name in valid_tasks and task_name != "clarification_needed":
+                # Pass channel and thread_ts for ticket_creation
+                if task_name == "ticket_creation":
+                    channel = payload.get("channel") or payload["event"].get("channel")
+                    thread_ts = payload["event"].get("thread_ts") or payload["event"].get("ts") or payload.get("thread_ts") or payload.get("ts")
+                    result = task_fn(
+                        question=user_message,
+                        conversation_id=conversation_id,
+                        # Always pass full thread_history for ticket_creation
+                        thread_history=thread_history,
+                        channel=channel,
+                        thread_ts=thread_ts
+                    )
+                else:
+                    result = task_fn(
+                        question=user_message,
+                        conversation_id=conversation_id,
+                        context_summary=supervisor_result.get("context_summary"),
+                        thread_history=supervisor_result.get("thread_history")
+                    )
+                print(f"[DEBUG] Result from {task_name}: {result}")
+                return {"result": result, "task": task_name, "conversation_id": conversation_id}
+            else:
+                return {"result": "Supervisor could not determine the correct agent. Please clarify your request.", "task": task_name, "conversation_id": conversation_id}
+        else:
+            task_name = str(supervisor_result).strip().lower()
+            print(f"[DEBUG] Task selected by Supervisor: {task_name}")
+            task_fn = getattr(theo, task_name, None)
+            if task_fn and task_name in valid_tasks and task_name != "clarification_needed":
+                # Pass channel and thread_ts for ticket_creation
+                if task_name == "ticket_creation":
+                    channel = payload.get("channel") or payload["event"].get("channel")
+                    thread_ts = payload["event"].get("thread_ts") or payload["event"].get("ts") or payload.get("thread_ts") or payload.get("ts")
+                    result = task_fn(
+                        question=user_message,
+                        conversation_id=conversation_id,
+                        thread_history=thread_history,
+                        channel=channel,
+                        thread_ts=thread_ts
+                    )
+                else:
+                    result = task_fn(question=user_message, conversation_id=conversation_id, thread_history=thread_history)
+                print(f"[DEBUG] Result from {task_name}: {result}")
+                return {"result": result, "task": task_name, "conversation_id": conversation_id}
+            elif task_name == "clarification_needed":
+                return {"result": "Supervisor could not determine the correct agent. Please clarify your request.", "task": task_name, "conversation_id": conversation_id}
+            else:
+                return {"result": f"Supervisor returned unknown task: {task_name}", "task": task_name, "conversation_id": conversation_id}
+
+# Stub: Hand off event to Supervisor agent
+async def handle_event_with_supervisor(event_type: str, payload: dict, parent_span=None, thread_history=None):
+    if parent_span is not None:
+        span = tracer.start_span("supervisor.handle_event", child_of=parent_span)
+    else:
+        span = tracer.start_span("supervisor.handle_event")
+    with span:
+        datadog.log_audit_event({"event_type": event_type, "payload": payload})
+        response = route_event_to_crew(event_type, payload, parent_span=span, thread_history=thread_history)
+        return response
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.get("/healthcheck")
+async def healthcheck():
+    return {"status": "ok"}
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    payload = await request.json()
+    event = payload.get("event", {})
+    channel = payload.get("channel") or event.get("channel")
+    parent_ts = event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("ts")
+
+    # Handle reaction_added events for conversation conclusion
+    if event.get("type") == "reaction_added":
+        reaction = event.get("reaction")
+        item = event.get("item", {})
+        thread_ts = item.get("ts")
+        channel = item.get("channel")
+        if reaction in ["white_check_mark", "x"] and thread_ts and channel:
+            with concluded_threads_lock:
+                concluded_threads.add(thread_ts)
+            if reaction == "white_check_mark":
+                # Thank and prompt for rating
+                send_slack_message(channel, "Thank you for concluding the conversation! 🙏 If you found this helpful, please rate your experience (1-5 stars).", thread_ts=thread_ts)
+            elif reaction == "x":
+                # Apologize and tag admin
+                admin_id = os.getenv("ADMIN_SLACK_USER_ID")
+                apology = f"We're sorry this didn't help. <@{admin_id}> will assist you shortly!"
+                send_slack_message(channel, apology, thread_ts=thread_ts)
+            return JSONResponse({"message": "Slack conversation concluded"}, status_code=status.HTTP_200_OK)
+
+    # If thread is concluded, only respond if bot is explicitly tagged
+    if parent_ts:
+        with concluded_threads_lock:
+            if parent_ts in concluded_threads:
+                user_message = event.get("text", "")
+                mention_str = f"<@{os.getenv('SLACK_BOT_USER_ID')}>"
+                if mention_str not in user_message and "@theo" not in user_message.lower():
+                    return JSONResponse({"message": "Thread concluded, ignoring message unless bot is tagged."}, status_code=status.HTTP_200_OK)
+
+    # Pre-check: Should we process this event?
+    should_process = True
+    if event.get("user") == SLACK_BOT_USER_ID or event.get("bot_id") or event.get("subtype") == "bot_message":
+        should_process = False
+    elif event.get("type") != "app_mention":
+        if not (event.get("type") == "message" and event.get("thread_ts")):
+            should_process = False
+
+    if not should_process:
+        return JSONResponse({"message": "Slack event ignored"}, status_code=status.HTTP_200_OK)
+
+    # Only add reactions if we are processing
+    if channel and parent_ts:
+        add_slack_reaction(channel, parent_ts, "robot_face")
+        add_slack_reaction(channel, parent_ts, "hourglass_flowing_sand")
+    try:
+        with tracer.start_span("conversation.workflow", service="theo", resource="slack_event") as parent_span:
+            parent_span.set_tag("conversation.id", parent_ts)
+            parent_span.set_tag("event.type", "slack")
+            msg_ts = event.get("ts")
+            with processed_messages_lock:
+                if msg_ts and msg_ts in processed_messages:
+                    return JSONResponse({"message": "Duplicate event, already processed."}, status_code=status.HTTP_200_OK)
+                if msg_ts:
+                    processed_messages.add(msg_ts)
+            # Fetch thread history for context
+            thread_history = []
+            if channel and parent_ts:
+                thread_history = fetch_thread_history(channel, parent_ts)
+            supervisor_response = await handle_event_with_supervisor("slack", payload, parent_span=parent_span, thread_history=thread_history)
+            answer = supervisor_response.get("result") or "No answer generated."
+            if channel and answer and not answer.startswith("Ignoring bot's own message") and not answer.startswith("Bot not mentioned") and not answer.startswith("Ignoring Slack event type"):
+                send_slack_message(channel, answer, thread_ts=parent_ts)
+    except Exception as e:
+        if channel and parent_ts:
+            add_slack_reaction(channel, parent_ts, "internet-problems")
+        admin_id = os.getenv("ADMIN_SLACK_USER_ID")
+        if admin_id and channel and parent_ts:
+            send_slack_message(channel, f":internet-problems: Error occurred, <@{admin_id}>", thread_ts=parent_ts)
+        raise
+    finally:
+        # Always remove hourglass after processing, unless this was a reaction_added event
+        if event.get("type") != "reaction_added" and channel and parent_ts:
+            remove_slack_reaction(channel, parent_ts, "hourglass_flowing_sand")
+    return JSONResponse({"message": "Slack event received", "supervisor_response": supervisor_response}, status_code=status.HTTP_200_OK)
+
+@app.post("/github/webhook")
+async def github_webhook(request: Request):
+    payload = await request.json()
+    conversation_id = payload.get("thread_id") or payload.get("issue", {}).get("id") or payload.get("pull_request", {}).get("id")
+    with tracer.trace("conversation.workflow", service="theo", resource="github_event") as parent_span:
+        parent_span.set_tag("conversation.id", conversation_id)
+        parent_span.set_tag("event.type", "github")
+        supervisor_response = await handle_event_with_supervisor("github", payload, parent_span=parent_span)
+    return JSONResponse({"message": "GitHub webhook received", "supervisor_response": supervisor_response}, status_code=status.HTTP_200_OK)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("src.theo.api:app", host="0.0.0.0", port=port, reload=True) 
