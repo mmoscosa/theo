@@ -6,7 +6,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 class BedrockClient:
     def __init__(self):
         self.region = os.getenv("AWS_REGION", "us-east-1")
-        self.code_doc_kb = os.getenv("BEDROCK_CODE_DOCUMENTATION_KB_ID")
+        self.code_doc_kb = os.getenv("BEDROCK_CORE_DOCUMENTATION_KB_ID")
         self.db_schema_kb = os.getenv("BEDROCK_DB_SCHEMA_QUERIES_KB_ID")
         self.general_kb = os.getenv("BEDROCK_GENERAL_KB_ID")
         self.client = boto3.client("bedrock-agent-runtime", region_name=self.region)

@@ -5,6 +5,8 @@ alwaysApply: true
 ---
 # Theo / Cursor Agent System Rules & Context
 
+IMPORTANT: Because we use CrewAi then LiteLLM is required, all LLM implementations should be through LiteLLM
+
 ---
 
 ## 🔑 Core Rules & Config
@@ -85,7 +87,7 @@ DD_TRACE_STDOUT=false
 
 # ─── AWS & Bedrock KBs ──────────────────────────────────────────────────────
 AWS_REGION=us-east-1
-BEDROCK_CODE_DOCUMENTATION_KB_ID=
+BEDROCK_CORE_DOCUMENTATION_KB_ID=
 BEDROCK_DB_SCHEMA_QUERIES_KB_ID=
 BEDROCK_GENERAL_KB_ID=
 
@@ -111,6 +113,7 @@ JIRA_PROJECT_KEY=
 CONFLUENCE_BASE_URL=
 CONFLUENCE_SPACE_KEY=UP
 CONFLUENCE_ADMIN_USER=
+CONFLUENCE_API_TOKEN=
 
 # ─── Agent Models ───────────────────────────────────────────────────────────
 AGENT_SUPERVISOR_MODEL=gemini-2.5-pro-preview-05-06
@@ -169,3 +172,36 @@ AGENT_PRODUCT_MANAGER_MODEL=chatgpt-4o-latest-20250326
 
 **GeneralKnowledge**:  
 `entryId, conversationId, timestamp, agent, snippet, summary, topic, relatedDocs, tags, embeddingVector`
+
+
+# LLM Routing & Observability Rule
+
+**Always use `litellm.completion` for all agent LLM calls in CrewAI.**
+- `litellm` is required for CrewAI's agent orchestration, provider routing, and compatibility.
+- Use `LLMObs.annotate` only for logging/observability, not as a replacement for the LLM call itself.
+- Never replace `litellm.completion` with `LLMObs.annotate` or any other LLM call in agent routing, supervisor, or core agent logic.
+
+**Pattern:**
+```python
+import litellm
+from ddtrace.llmobs import LLMObs
+
+response = litellm.completion(
+    model=model,
+    messages=[...]
+)
+main_content = response['choices'][0]['message']['content']
+LLMObs.annotate(
+    input_data=[...],
+    output_data=[{"role": "assistant", "content": main_content}],
+    tags={...}
+)
+```
+
+**If you need to add observability, do so as a side-effect, not as the main LLM call.**
+
+| Task                        | Use                |
+|-----------------------------|--------------------|
+| LLM call for agent logic    | `litellm.completion` |
+| Observability/logging       | `LLMObs.annotate`  |
+

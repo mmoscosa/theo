@@ -150,23 +150,58 @@ async def slack_events(request: Request):
     channel = payload.get("channel") or event.get("channel")
     parent_ts = event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("ts")
 
+    def thread_already_documented(thread_history):
+        for msg in thread_history:
+            # Check if the message is from the bot and contains a documentation update marker
+            if (
+                (msg.get("bot_id") or msg.get("user") == SLACK_BOT_USER_ID)
+                and "Documentation Update" in (msg.get("text", "") or "")
+            ):
+                return True
+        return False
+
     # Handle reaction_added events for conversation conclusion
     if event.get("type") == "reaction_added":
         reaction = event.get("reaction")
         item = event.get("item", {})
         thread_ts = item.get("ts")
         channel = item.get("channel")
-        if reaction in ["white_check_mark", "x"] and thread_ts and channel:
+        user = event.get("user")
+        bot_user_id = os.getenv("SLACK_BOT_USER_ID")
+        if reaction == "white_check_mark" and thread_ts and channel and user != bot_user_id:
+            thread_history = fetch_thread_history(channel, thread_ts)
+            if thread_already_documented(thread_history):
+                print(f"[INFO] Documentation already exists for thread {thread_ts}, skipping update.")
+                send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nDocumentation for this thread has already been created/updated. No further documentation has been made.", thread_ts=thread_ts)
+                return JSONResponse({"message": "Documentation already exists, skipped update."}, status_code=status.HTTP_200_OK)
+            with concluded_threads_lock:
+                if thread_ts in concluded_threads:
+                    print(f"[INFO] Thank-you message already sent for thread {thread_ts}, skipping duplicate.")
+                    return JSONResponse({"message": "Thank-you already sent"}, status_code=status.HTTP_200_OK)
+                concluded_threads.add(thread_ts)
+            # Only trigger if thread has technical content
+            if any(
+                any(keyword in (msg.get('text', '') or '').lower() for keyword in ["error", "workflow", "api", "scraper", "bug", "fix", "update", "document", "sql", "data"]) 
+                for msg in thread_history
+            ):
+                theo = Theo()
+                theo.documentation_update(
+                    question="Update the documentation based on this thread.",
+                    conversation_id=thread_ts,
+                    thread_history=thread_history
+                )
+                print(f"[INFO] Triggered documentation update for thread {thread_ts} in channel {channel} via :white_check_mark: reaction.")
+            else:
+                print(f"[INFO] Thread {thread_ts} did not contain technical content, skipping doc update.")
+            # Thank and prompt for rating
+            send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nI have updated our documentation with what I learned from this conversation.", thread_ts=thread_ts)
+            return JSONResponse({"message": "Slack conversation concluded"}, status_code=status.HTTP_200_OK)
+        elif reaction == "x" and thread_ts and channel:
             with concluded_threads_lock:
                 concluded_threads.add(thread_ts)
-            if reaction == "white_check_mark":
-                # Thank and prompt for rating
-                send_slack_message(channel, "Thank you for concluding the conversation! 🙏 If you found this helpful, please rate your experience (1-5 stars).", thread_ts=thread_ts)
-            elif reaction == "x":
-                # Apologize and tag admin
-                admin_id = os.getenv("ADMIN_SLACK_USER_ID")
-                apology = f"We're sorry this didn't help. <@{admin_id}> will assist you shortly!"
-                send_slack_message(channel, apology, thread_ts=thread_ts)
+            admin_id = os.getenv("ADMIN_SLACK_USER_ID")
+            apology = f"We're sorry this didn't help. <@{admin_id}> will assist you shortly!"
+            send_slack_message(channel, apology, thread_ts=thread_ts)
             return JSONResponse({"message": "Slack conversation concluded"}, status_code=status.HTTP_200_OK)
 
     # If thread is concluded, only respond if bot is explicitly tagged
