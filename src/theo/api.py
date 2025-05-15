@@ -25,6 +25,7 @@ concluded_threads = set()
 concluded_threads_lock = Lock()
 processed_messages = set()
 processed_messages_lock = Lock()
+processed_reactions = set()
 
 def extract_conversation_id(event_type, payload):
     if event_type == "slack":
@@ -150,6 +151,14 @@ async def slack_events(request: Request):
     channel = payload.get("channel") or event.get("channel")
     parent_ts = event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("ts")
 
+    # Early exit: If thread is concluded, ignore all events unless bot is tagged
+    with concluded_threads_lock:
+        if parent_ts in concluded_threads:
+            user_message = event.get("text", "")
+            mention_str = f"<@{os.getenv('SLACK_BOT_USER_ID')}>"
+            if mention_str not in user_message and "@theo" not in user_message.lower():
+                return JSONResponse({"message": "Thread concluded, ignoring message unless bot is tagged."}, status_code=status.HTTP_200_OK)
+
     def thread_already_documented(thread_history):
         for msg in thread_history:
             # Check if the message is from the bot and contains a documentation update marker
@@ -168,33 +177,51 @@ async def slack_events(request: Request):
         channel = item.get("channel")
         user = event.get("user")
         bot_user_id = os.getenv("SLACK_BOT_USER_ID")
+        # Deduplicate by (channel, thread_ts, reaction)
+        reaction_key = (channel, thread_ts, reaction)
+        if reaction_key in processed_reactions:
+            print(f"[INFO] Reaction {reaction} for thread {thread_ts} in channel {channel} already processed.")
+            return JSONResponse({"message": "Duplicate reaction event, already processed."}, status_code=status.HTTP_200_OK)
+        processed_reactions.add(reaction_key)
         if reaction == "white_check_mark" and thread_ts and channel and user != bot_user_id:
-            thread_history = fetch_thread_history(channel, thread_ts)
-            if thread_already_documented(thread_history):
-                print(f"[INFO] Documentation already exists for thread {thread_ts}, skipping update.")
-                send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nDocumentation for this thread has already been created/updated. No further documentation has been made.", thread_ts=thread_ts)
-                return JSONResponse({"message": "Documentation already exists, skipped update."}, status_code=status.HTTP_200_OK)
             with concluded_threads_lock:
                 if thread_ts in concluded_threads:
                     print(f"[INFO] Thank-you message already sent for thread {thread_ts}, skipping duplicate.")
                     return JSONResponse({"message": "Thank-you already sent"}, status_code=status.HTTP_200_OK)
                 concluded_threads.add(thread_ts)
+            thread_history = fetch_thread_history(channel, thread_ts)
+            theo = Theo()
+            # Generate a supervisor LLM summary for TKB
+            context_summary = theo.summarize_thread(thread_history)
+            if thread_already_documented(thread_history):
+                print(f"[INFO] Documentation already exists for thread {thread_ts}, skipping update.")
+                # Always update TKB (General Knowledge) with a summary
+                theo.documentation_update(
+                    question="Update the documentation based on this thread.",
+                    conversation_id=thread_ts,
+                    thread_history=thread_history,
+                    context_summary=context_summary,
+                    close_conversation=True
+                )
+                send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nI have updated our knowledge base with what I learned from this conversation.", thread_ts=thread_ts)
+                return JSONResponse({"message": "Documentation already exists, but my knowledge base has been updated."}, status_code=status.HTTP_200_OK)
             # Only trigger if thread has technical content
             if any(
                 any(keyword in (msg.get('text', '') or '').lower() for keyword in ["error", "workflow", "api", "scraper", "bug", "fix", "update", "document", "sql", "data"]) 
                 for msg in thread_history
             ):
-                theo = Theo()
                 theo.documentation_update(
                     question="Update the documentation based on this thread.",
                     conversation_id=thread_ts,
-                    thread_history=thread_history
+                    thread_history=thread_history,
+                    context_summary=context_summary,
+                    close_conversation=True
                 )
                 print(f"[INFO] Triggered documentation update for thread {thread_ts} in channel {channel} via :white_check_mark: reaction.")
             else:
                 print(f"[INFO] Thread {thread_ts} did not contain technical content, skipping doc update.")
             # Thank and prompt for rating
-            send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nI have updated our documentation with what I learned from this conversation.", thread_ts=thread_ts)
+            send_slack_message(channel, "Thank you for concluding the conversation! :green_heart:\nI have updated our knowledge base with what I learned from this conversation.", thread_ts=thread_ts)
             return JSONResponse({"message": "Slack conversation concluded"}, status_code=status.HTTP_200_OK)
         elif reaction == "x" and thread_ts and channel:
             with concluded_threads_lock:
@@ -203,15 +230,6 @@ async def slack_events(request: Request):
             apology = f"We're sorry this didn't help. <@{admin_id}> will assist you shortly!"
             send_slack_message(channel, apology, thread_ts=thread_ts)
             return JSONResponse({"message": "Slack conversation concluded"}, status_code=status.HTTP_200_OK)
-
-    # If thread is concluded, only respond if bot is explicitly tagged
-    if parent_ts:
-        with concluded_threads_lock:
-            if parent_ts in concluded_threads:
-                user_message = event.get("text", "")
-                mention_str = f"<@{os.getenv('SLACK_BOT_USER_ID')}>"
-                if mention_str not in user_message and "@theo" not in user_message.lower():
-                    return JSONResponse({"message": "Thread concluded, ignoring message unless bot is tagged."}, status_code=status.HTTP_200_OK)
 
     # Pre-check: Should we process this event?
     should_process = True

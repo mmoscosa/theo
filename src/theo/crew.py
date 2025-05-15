@@ -34,6 +34,10 @@ from theo.tools.jira import create_jira_ticket
 from theo.tools.slack import send_slack_message
 import logging
 from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages
+import html
+
+# Global set to track which threads have updated TBIKB
+updated_tbikb_threads = set()
 
 # If you want to run a snippet of code before or after the crew starts,
 # you can use the @before_kickoff and @after_kickoff decorators
@@ -190,12 +194,59 @@ class Theo():
                 "context_summary": context_summary
             } if answer_clean in ["support_request", "ticket_creation"] else answer_clean
 
-    def documentation_update(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
-        print(f"[DEBUG] documentation_update called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}, kwargs={kwargs}")
+    def _contains_sql(self, thread_history):
+        sql_pattern = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|WITH)\b", re.IGNORECASE)
+        code_block_pattern = re.compile(r"```(.*?)```", re.DOTALL)
+        inline_code_pattern = re.compile(r"`([^`]+)`")
+        for msg in thread_history or []:
+            text = msg.get("text", "") or ""
+            # Check all code blocks (regardless of language)
+            for match in code_block_pattern.finditer(text):
+                if sql_pattern.search(match.group(1)):
+                    return True
+            # Check all inline code segments
+            for match in inline_code_pattern.finditer(text):
+                if sql_pattern.search(match.group(1)):
+                    return True
+            # Also check all lines for SQL keywords
+            for line in text.splitlines():
+                if sql_pattern.search(line):
+                    return True
+        return False
+
+    def _extract_successful_sqls(self, thread_history):
+        sql_blocks = []
+        sql_pattern = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|WITH)\b", re.IGNORECASE)
+        code_block_pattern = re.compile(r"```(.*?)```", re.DOTALL)
+        inline_code_pattern = re.compile(r"`([^`]+)`")
+        for msg in thread_history or []:
+            text = msg.get("text", "") or ""
+            # Extract all code blocks and check for SQL
+            for match in code_block_pattern.finditer(text):
+                code = match.group(1).strip()
+                if sql_pattern.search(code):
+                    sql_blocks.append(code)
+            # Extract all inline code segments and check for SQL
+            for match in inline_code_pattern.finditer(text):
+                code = match.group(1).strip()
+                if sql_pattern.search(code):
+                    sql_blocks.append(code)
+            # Also extract lines that look like SQL
+            for line in text.splitlines():
+                if sql_pattern.match(line.strip()):
+                    sql_blocks.append(line.strip())
+        return sql_blocks
+
+    def documentation_update(self, question=None, conversation_id=None, context_summary=None, thread_history=None, close_conversation=False, **kwargs):
+        """
+        If close_conversation is True, this is a :white_check_mark: event and should update TKB (General Knowledge) and TBIKB (if SQL present).
+        If not, this is a documentation prompt and should update UP (main doc) and TBIKB (if SQL present).
+        """
+        print(f"[DEBUG] documentation_update called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}, close_conversation={close_conversation}, kwargs={kwargs}")
         datadog = DatadogClient()
         agent_role = "Technical Writer"
         model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
-        model_provider = get_model_provider("AGENT_TECHNICAL_WRITER_MODEL", "AGENT_TECHNICAL_WRITER_PROVIDER")
+        model_provider = self.get_model_provider("AGENT_TECHNICAL_WRITER_MODEL", "AGENT_TECHNICAL_WRITER_PROVIDER")
         timeline = []
         if thread_history:
             for msg in thread_history:
@@ -211,9 +262,9 @@ class Theo():
             f"Summary:\n{context_summary}\n\n"
             "Write only the documentation content."
         )
-        print(f"[DEBUG] Technical Writer LLM prompt: {doc_prompt}")
         import litellm
         from ddtrace.llmobs import LLMObs
+        # Generate documentation content
         try:
             response = litellm.completion(
                 model=model,
@@ -223,10 +274,8 @@ class Theo():
                 ]
             )
             doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
-            print(f"[DEBUG] Technical Writer LLM raw output: {doc_content}")
             if not doc_content or doc_content == "None":
                 doc_content = "Documentation could not be generated."
-            # Log to LLMObs for observability
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": doc_prompt}],
                 output_data=[{"role": "assistant", "content": doc_content}],
@@ -235,12 +284,11 @@ class Theo():
         except Exception as e:
             print(f"[ERROR] Technical Writer LLM call failed: {e}")
             doc_content = "Documentation could not be generated."
-        # 2. Generate a concise, descriptive page title
+        # Generate a concise, descriptive page title
         title_prompt = (
             "Given the following documentation content, generate a concise, descriptive Confluence page title suitable for both product and engineering audiences.\n\n"
             f"Content:\n{doc_content}\n"
         )
-        print(f"[DEBUG] Technical Writer Title LLM prompt: {title_prompt}")
         try:
             response = litellm.completion(
                 model=model,
@@ -250,12 +298,10 @@ class Theo():
                 ]
             )
             page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
-            print(f"[DEBUG] Technical Writer Title LLM raw output: {page_title}")
             if page_title:
                 page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
             if not page_title or page_title.strip().lower() == "none":
                 page_title = question or 'New Documentation'
-            # Log to LLMObs for observability
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": title_prompt}],
                 output_data=[{"role": "assistant", "content": page_title}],
@@ -264,135 +310,102 @@ class Theo():
         except Exception as e:
             print(f"[ERROR] Technical Writer Title LLM call failed: {e}")
             page_title = question or 'New Documentation'
-        print(f"[DEBUG] Generated Confluence page title: {page_title}")
-        print(f"[DEBUG] Generated documentation content: {doc_content}")
-        # 1. Use LLM to generate a focused search query from the user request and context
-        search_query_prompt = (
-            "Given the following user request and conversation context, generate a concise search query to find the most relevant documentation page in Confluence.\n"
-            f"User request: {question}\n"
-            f"Summary: {context_summary}\n"
-        )
-        try:
-            search_query_response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": search_query_prompt}
-                ]
-            )
-            search_query = search_query_response['choices'][0]['message']['content'].strip()
-            print(f"[DEBUG] LLM-generated Bedrock search query: {search_query}")
-        except Exception as e:
-            print(f"[ERROR] LLM call for search query failed: {e}")
-            search_query = question or context_summary or ''
-        # 2. Use Bedrock to search for relevant documentation pages
-        bedrock = BedrockClient()
-        code_docs = bedrock.search_code_documentation(search_query)
-        print(f"[DEBUG] Bedrock code documentation search result: {code_docs}")
-        # 3. Cross-match Bedrock candidates with Confluence pages
-        import difflib
-        best_page_id = None
-        candidate_titles = [doc.get('title', '').strip() for doc in code_docs] if code_docs and isinstance(code_docs, list) else []
-        all_pages = []
-        try:
-            all_pages = get_all_confluence_pages()
-        except Exception as e:
-            print(f"[ERROR] Could not fetch all Confluence pages: {e}")
-        all_titles = [p['title'].strip() for p in all_pages]
-        for candidate_title in candidate_titles:
-            # Try exact case-insensitive match
-            for page in all_pages:
-                if candidate_title.lower() == page['title'].strip().lower():
-                    best_page_id = page['id']
-                    print(f"[DEBUG] Matched Bedrock candidate '{candidate_title}' to Confluence page '{page['title']}' (id={best_page_id})")
+        # SQL detection
+        has_sql = self._contains_sql(thread_history)
+        sql_blocks = self._extract_successful_sqls(thread_history) if has_sql else []
+        # Defensive: Ensure conversation_id is set
+        if conversation_id is None and thread_history:
+            for msg in thread_history:
+                if msg.get("thread_ts"):
+                    conversation_id = msg["thread_ts"]
+                    print(f"[DEBUG] Fallback: set conversation_id from thread_history: {conversation_id}")
                     break
-            if best_page_id:
-                break
-            # Fuzzy match (optional, e.g., >0.8 similarity)
-            matches = difflib.get_close_matches(candidate_title, all_titles, n=1, cutoff=0.8)
-            if matches:
-                for page in all_pages:
-                    if page['title'].strip() == matches[0]:
-                        best_page_id = page['id']
-                        print(f"[DEBUG] Fuzzy matched Bedrock candidate '{candidate_title}' to Confluence page '{page['title']}' (id={best_page_id})")
-                        break
-            if best_page_id:
-                break
-        # 4. Update or create
-        updated = False
-        confluence_url = None
-        confluence_api_response = None
-        slack_update_success_message = "Thank you for concluding the conversation! :green_heart: I have updated our documentation with what I learned from this conversation."
-        slack_update_error_message = "Thank you for concluding the conversation! :green_heart:\n:warning: Failed to update documentation due to an error. Please contact support."
-        try:
-            if best_page_id:
-                print(f"[DEBUG] Updating Confluence page {best_page_id}")
-                confluence_api_response = update_confluence_page(best_page_id, doc_content)
-                updated = True
-            else:
-                print(f"[DEBUG] No relevant page found, creating new Confluence page")
-                confluence_api_response = create_confluence_page(page_title, doc_content)
-            print(f"[DEBUG] Confluence API response: {confluence_api_response}")
-            # Only send Slack message if update/create succeeded
-            if 'channel' in kwargs and kwargs['channel'] and 'thread_ts' in kwargs and kwargs['thread_ts']:
-                send_slack_message(kwargs['channel'], slack_update_success_message, thread_ts=kwargs['thread_ts'])
-        except Exception as e:
-            print(f"[ERROR] Failed to update/create Confluence page: {e}")
-            if 'channel' in kwargs and kwargs['channel'] and 'thread_ts' in kwargs and kwargs['thread_ts']:
-                send_slack_message(kwargs['channel'], slack_update_error_message, thread_ts=kwargs['thread_ts'])
-        # Build Confluence URL if available
-        if confluence_api_response and isinstance(confluence_api_response, dict):
-            page_id = confluence_api_response.get("id")
+        print(f"[DEBUG] has_sql: {has_sql}, sql_blocks: {sql_blocks}, conversation_id: {conversation_id}")
+        # Main doc update (UP) if prompted
+        if not close_conversation:
+            from theo.tools.confluence import create_confluence_page
+            print(f"[DEBUG] Creating/Updating main doc in UP space.")
+            confluence_response = create_confluence_page(page_title, doc_content, space_key=os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP"))
+            # Build Confluence URL
+            page_id = confluence_response.get("id")
             base_url = os.getenv("CONFLUENCE_BASE_URL")
-            if page_id and base_url:
-                confluence_url = f"{base_url}/pages/viewpage.action?pageId={page_id}"
-        # 5. Generate a friendly summary/call-to-action using LLM
-        if confluence_url:
-            slack_prompt = (
-                f"Write a friendly, concise summary for Slack to notify the team that new documentation has been created or updated in Confluence. "
-                f"Title: {page_title}\n"
-                f"Summary: {doc_content[:300]}...\n"
-                f"Include this link: {confluence_url}\n"
-                "Do not include any signatures or emojis."
+            confluence_url = f"{base_url}/pages/viewpage.action?pageId={page_id}" if page_id and base_url else ""
+            # Generate summary with <title:url> style
+            summary = f"Documentation for <{confluence_url}|{page_title}> has been created/updated."
+            slack_message = (
+                ":books: Documentation Update\n\n"
+                f"{summary}\n\n"
+                "Taken by :memo: Technical Writer"
             )
         else:
-            slack_prompt = (
-                f"Write a friendly, concise summary for Slack to notify the team that new documentation has been created or updated in Confluence. "
-                f"Title: {page_title}\n"
-                f"Summary: {doc_content[:300]}...\n"
-                "The link is not available yet, so mention that it will be shared soon. "
-                "Do not include any signatures or emojis."
-            )
-        try:
-            slack_response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": slack_prompt}
-                ]
-            )
-            summary_content = slack_response['choices'][0]['message']['content']
-            print(f"[DEBUG] LLM-generated Slack summary: {summary_content}")
-        except Exception as e:
-            print(f"[ERROR] LLM call for Slack message failed: {e}")
-            if confluence_url:
-                summary_content = f"Documentation has been created/updated in Confluence. View it here: <{confluence_url}>"
+            slack_message = None
+        # BI KB update (TBIKB) if SQL present and not already updated
+        if has_sql and sql_blocks and conversation_id is not None:
+            global updated_tbikb_threads
+            if conversation_id not in updated_tbikb_threads:
+                print(f"[DEBUG] Updating TBIKB for conversation_id: {conversation_id}")
+                from theo.tools.confluence import create_confluence_page
+                unique_sqls = list(set(sql_blocks))
+                sql_descriptions = []
+                for sql in unique_sqls:
+                    # Use LLM to generate a description
+                    llm_desc_prompt = (
+                        "You are a BI engineer. Given the following SQL query, write a one-sentence description of what it does, suitable for future reference.\n\nSQL:\n"
+                        f"{sql}\n\nDescription:"
+                    )
+                    try:
+                        response = litellm.completion(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": "You are a BI engineer."},
+                                {"role": "user", "content": llm_desc_prompt}
+                            ]
+                        )
+                        description = response['choices'][0]['message']['content'].strip() if response and 'choices' in response else "No description generated."
+                    except Exception as e:
+                        print(f"[ERROR] LLM call for SQL description failed: {e}")
+                        description = "No description generated."
+                    # Escape SQL for XML
+                    sql_escaped = html.escape(sql)
+                    sql_block = (
+                        f'<p><strong>Description:</strong> {html.escape(description)}</p>'
+                        f'<ac:structured-macro ac:name="code">'
+                        f'<ac:parameter ac:name="language">sql</ac:parameter>'
+                        f'<ac:plain-text-body><![CDATA[{sql}\n]]></ac:plain-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                    sql_descriptions.append(sql_block)
+                sql_doc = "\n\n".join(sql_descriptions)
+                sql_title = f"SQLs for: {page_title}"
+                print(f"[DEBUG] Creating/Updating BI KB in TBIKB space.")
+                create_confluence_page(sql_title, sql_doc, space_key=os.getenv("CONFLUENCE_SPACE_KEY_TBIKB", "TBIKB"))
+                updated_tbikb_threads.add(conversation_id)
             else:
-                summary_content = "Documentation has been created/updated in the knowledge base. The link will be shared soon."
-        # Always wrap in the template
-        slack_message = (
-            ":books: Documentation Update\n\n"
-            f"{summary_content}\n\n"
-            "_Taken by 📝 Technical Writer_"
-        )
-        slack_message = markdown_to_slack(slack_message)
-        datadog.log_audit_event({
-            "event_type": "documentation_update",
-            "question": question,
-            "answer": doc_content,
-            "conversation_id": conversation_id
-        })
-        return slack_message
+                print(f"[DEBUG] Skipping TBIKB update for conversation_id: {conversation_id} (already updated)")
+        # General Knowledge update (TKB) if closing conversation
+        if close_conversation:
+            # Defensive: If context_summary is None, 'None', or empty, build a fallback summary from thread_history
+            if not context_summary or str(context_summary).strip().lower() == "none":
+                if thread_history:
+                    fallback_msgs = []
+                    for msg in thread_history[-5:]:
+                        user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                        text = msg.get("text", "").strip()
+                        if text:
+                            fallback_msgs.append(f"{user}: {text}")
+                    context_summary = "\n".join(fallback_msgs) if fallback_msgs else "No summary available."
+                else:
+                    context_summary = "No summary available."
+            from theo.tools.confluence import create_confluence_page
+            summary_title = f"Summary for: {page_title}"
+            summary_content = f"Summary of conversation for supervisor context:\n\n{context_summary}\n\nKey points:\n{doc_content}"
+            print(f"[DEBUG] Creating/Updating General Knowledge in TKB space.")
+            create_confluence_page(summary_title, summary_content, space_key=os.getenv("CONFLUENCE_SPACE_KEY_TKB", "TKB"))
+        # Return the correct Slack message
+        if not close_conversation:
+            return slack_message
+        else:
+            return f"Documentation updated. Main doc: False, BI KB: {has_sql}, General KB: True"
 
     def bi_report(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
         print(f"[DEBUG] bi_report called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}, kwargs={kwargs}")
