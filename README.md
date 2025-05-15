@@ -1,8 +1,12 @@
 # Theo Crew
 
 Theo Crew is a multi-agent, production-grade FastAPI service orchestrating LLM-powered agents for support, documentation, BI, and product management workflows. It features:
+- **Semantic documentation updates:** LLM+Bedrock finds and updates the most relevant Confluence page for a topic, using both semantic search and exact/fuzzy title matching. No duplicate pages are created—if a page exists, it is always updated.
+- **White-checkmark reaction deduplication:** The ✅ reaction only triggers a documentation update if it hasn't already been done for the thread, preventing redundant updates.
+- **Robust Slack notifications:** Slack messages about documentation updates are only sent if the update succeeds. Clear error messages are sent if something goes wrong.
+- **Error handling & observability:** All errors are logged, surfaced in Slack, and traced in Datadog LLM Observability for full traceability.
+- **Production-grade automation:** All configuration is via environment variables. The system is robust, observable, and user-friendly for automated documentation, support, and analytics workflows.
 - **Slack-first conversational UX** (reactions, thread-based, admin escalation)
-- **Datadog LLM Observability** (tracing, audit, metrics)
 - **Hot-reload dev workflow** with Docker Compose
 - **AWS Bedrock** for vector search knowledge bases
 - **Extensible agent system** powered by [crewAI](https://crewai.com)
