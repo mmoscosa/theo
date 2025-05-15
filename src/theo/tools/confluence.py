@@ -58,9 +58,10 @@ def update_confluence_page(page_id, new_content):
     logging.info(f"[Confluence] Page {page_id} updated successfully.")
     return put_resp.json()
 
-def create_confluence_page(title, content):
+def create_confluence_page(title, content, space_key=None):
     base_url = os.getenv("CONFLUENCE_BASE_URL")
-    space_key = os.getenv("CONFLUENCE_SPACE_KEY")
+    if space_key is None:
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
     user = os.getenv("CONFLUENCE_ADMIN_USER")
     api_token = os.getenv("CONFLUENCE_API_TOKEN")
     url = f"{base_url}/rest/api/content/"
@@ -80,7 +81,7 @@ def create_confluence_page(title, content):
     # Check for duplicate title before creating
     try:
         from theo.tools.confluence import get_all_confluence_pages, update_confluence_page
-        all_pages = get_all_confluence_pages()
+        all_pages = get_all_confluence_pages(space_key=space_key)
         for page in all_pages:
             if page["title"].strip().lower() == title.strip().lower():
                 print(f"[DEBUG] Page with title '{title}' already exists (id={page['id']}), updating instead of creating.")
@@ -97,9 +98,10 @@ def create_confluence_page(title, content):
     print(f"[DEBUG] Confluence API response: {resp.text}")
     return resp.json()
 
-def get_all_confluence_pages():
+def get_all_confluence_pages(space_key=None):
     base_url = os.getenv("CONFLUENCE_BASE_URL")
-    space_key = os.getenv("CONFLUENCE_SPACE_KEY")
+    if space_key is None:
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
     user = os.getenv("CONFLUENCE_ADMIN_USER")
     api_token = os.getenv("CONFLUENCE_API_TOKEN")
     url = f"{base_url}/rest/api/content"
