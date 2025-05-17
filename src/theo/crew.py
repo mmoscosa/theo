@@ -33,8 +33,10 @@ import litellm
 from theo.tools.jira import create_jira_ticket
 from theo.tools.slack import send_slack_message
 import logging
-from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages
+from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages, add_row_to_adr_index
 import html
+import requests
+from datetime import datetime
 
 # Global set to track which threads have updated TBIKB
 updated_tbikb_threads = set()
@@ -659,6 +661,17 @@ class Theo():
         bedrock = BedrockClient()
         db_docs = bedrock.search_db_schema(question)
         from ddtrace.llmobs import LLMObs
+        import litellm
+        import re
+        def extract_table_names(text):
+            # Simple regex to match table names in quotes or camelCase/underscored words
+            table_pattern = re.compile(r'"([a-zA-Z0-9_]+)"|\b([a-zA-Z][a-zA-Z0-9_]+)\b')
+            matches = table_pattern.findall(text)
+            # Flatten and filter empty
+            names = [m[0] or m[1] for m in matches if m[0] or m[1]]
+            # Remove common SQL keywords and duplicates
+            keywords = {"select", "from", "where", "join", "on", "group", "by", "order", "limit", "as", "and", "or", "not", "in", "is", "null", "count", "sum", "avg", "min", "max", "left", "right", "inner", "outer", "having", "distinct", "case", "when", "then", "else", "end"}
+            return [n for n in set(names) if n.lower() not in keywords]
         def _llm_call():
             timeline = []
             if thread_history:
@@ -669,25 +682,91 @@ class Theo():
                     if text:
                         timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
-            llm_prompt = (
-                f"You are a BI Engineer.\n"
-                f"User question: {question}\n"
-                f"Summary of conversation context: {context_summary}\n"
-                f"\nHere is relevant database schema and query documentation:\n---\n{db_docs}\n---\n"
-                f"Conversation timeline:\n{timeline_str}\n"
-                f"Generate a concise, context-aware BI report for the user."
-            )
-            print(f"[DEBUG] bi_engineer_answer LLM prompt: {llm_prompt}")
-            main_content = LLMObs.annotate(
-                input_data=[{"role": "user", "content": llm_prompt}],
-                output_data=[{"role": "assistant", "content": ""}],
-                tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
-            )
-            print(f"[DEBUG] bi_engineer_answer LLM main_content: {main_content}")
-            # If LLM returns None, empty, or 'none', provide a helpful fallback message
-            if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                main_content = ("Sorry, I could not find any relevant database schema or queries for your request. "
-                                "Please provide more details or check back later.")
+
+            # Try to extract table names from the question
+            table_names = extract_table_names(question)
+            print(f"[DEBUG] Extracted table names: {table_names}")
+            schemas = []
+            for table in table_names:
+                schema = bedrock.search_db_schema(f"{table} schema")
+                if schema and "no results" not in schema.lower() and "error" not in schema.lower():
+                    schemas.append((table, schema))
+            # If we found relevant schemas, build a focused prompt
+            if schemas:
+                schema_text = "\n\n".join([f"Schema for {t}:\n{s}" for t, s in schemas])
+                focused_prompt = (
+                    f"You are a BI Engineer.\n"
+                    f"User question: {question}\n"
+                    f"Summary of conversation context: {context_summary}\n"
+                    f"\nHere are the relevant database schemas:\n{schema_text}\n"
+                    f"Conversation timeline:\n{timeline_str}\n"
+                    f"Write a SQL query to answer the user's question using the schema(s) above. Then explain the query in plain English."
+                )
+                print(f"[DEBUG] Focused LLM prompt: {focused_prompt}")
+                response = litellm.completion(
+                    model=model,
+                    messages=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": focused_prompt}]
+                )
+                main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
+                    main_content = ("Sorry, I could not generate a SQL query for your request. Please provide more details or check back later.")
+                # Log to LLMObs for observability
+                LLMObs.annotate(
+                    input_data=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": focused_prompt}],
+                    output_data=[{"role": "assistant", "content": main_content}],
+                    tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
+                )
+            else:
+                # Fallback to current logic
+                no_results = (
+                    not db_docs or
+                    "no results" in db_docs.lower() or
+                    "error" in db_docs.lower() or
+                    "not set" in db_docs.lower() or
+                    db_docs.strip() == ""
+                )
+                if no_results:
+                    schema_info = bedrock.search_db_schema("utilityPartners schema")
+                    fallback_prompt = (
+                        f"You are a BI Engineer. The user asked: '{question}'.\n"
+                        f"Here is the schema for utilityPartners (if available):\n{schema_info}\n"
+                        f"If possible, generate a SQL query and a short report/summary to answer the user's question. "
+                        f"If you cannot generate a query, explain what information is missing."
+                    )
+                    print(f"[DEBUG] Fallback LLM prompt: {fallback_prompt}")
+                    response = litellm.completion(
+                        model=model,
+                        messages=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": fallback_prompt}]
+                    )
+                    main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                    if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
+                        main_content = ("Sorry, I could not find any relevant database schema or queries for your request. "
+                                        "Please provide more details or check back later.")
+                    # Log to LLMObs for observability
+                    LLMObs.annotate(
+                        input_data=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": fallback_prompt}],
+                        output_data=[{"role": "assistant", "content": main_content}],
+                        tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
+                    )
+                else:
+                    llm_prompt = (
+                        f"You are a BI Engineer.\n"
+                        f"User question: {question}\n"
+                        f"Summary of conversation context: {context_summary}\n"
+                        f"\nHere is relevant database schema and query documentation:\n---\n{db_docs}\n---\n"
+                        f"Conversation timeline:\n{timeline_str}\n"
+                        f"Generate a concise, context-aware BI report for the user."
+                    )
+                    print(f"[DEBUG] bi_engineer_answer LLM prompt: {llm_prompt}")
+                    main_content = LLMObs.annotate(
+                        input_data=[{"role": "user", "content": llm_prompt}],
+                        output_data=[{"role": "assistant", "content": ""}],
+                        tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
+                    )
+                    print(f"[DEBUG] bi_engineer_answer LLM main_content: {main_content}")
+                    if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
+                        main_content = ("Sorry, I could not find any relevant database schema or queries for your request. "
+                                        "Please provide more details or check back later.")
             slack_message = format_slack_response(
                 category_emoji=category_emoji,
                 category_title=category_title,
@@ -855,6 +934,288 @@ class Theo():
             return "anthropic"
         # Add more providers as needed
         return "openai"  # Fallback to OpenAI
+
+    def _markdown_table_to_bullet_list(self, md_text):
+        """Convert a Markdown table to a bullet list. Only processes the first table found."""
+        import re
+        lines = md_text.splitlines()
+        in_table = False
+        headers = []
+        bullets = []
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*\|', line):
+                if not in_table:
+                    in_table = True
+                    headers = [h.strip() for h in line.strip('|').split('|')]
+                    continue
+                # Skip separator row
+                if re.match(r'^\s*\|\s*-', line):
+                    continue
+                # Table row
+                cells = [c.strip() for c in line.strip('|').split('|')]
+                if len(cells) == len(headers):
+                    bullet = ', '.join(f"{headers[j]}: {cells[j]}" for j in range(len(headers)) if cells[j])
+                    bullets.append(f"- {bullet}")
+            elif in_table:
+                # End of table
+                break
+        if bullets:
+            # Remove the table from the text and insert the bullet list
+            table_start = next(i for i, l in enumerate(lines) if re.match(r'^\s*\|', l))
+            table_end = table_start + len(bullets) + 2  # +2 for header and separator
+            new_lines = lines[:table_start] + bullets + lines[table_end:]
+            return '\n'.join(new_lines)
+        return md_text
+
+    def create_adr_from_github(self, commit_title, commit_body, commit_url, author, date, diff_url=None, parent_adr_page_id=None):
+        """
+        Create a new ADR subpage and update the ADR Index table in Confluence based on a GitHub merge to main.
+        """
+        import litellm
+        from theo.tools.confluence import create_confluence_page, add_row_to_adr_index
+        from datetime import datetime
+        # 1. Generate ADR content using LLM
+        model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
+        adr_prompt = (
+            "IMPORTANT: Do NOT use tables. Use only a bullet list for the summary. If you use a table, your answer will be discarded.\n"
+            "For the summary section, use this format (not a table):\n"
+            "- Decision: Prevent duplicate activations. Consequence: Improved data integrity and sync process.\n"
+            "- Decision: Remove special characters. Consequence: Cleaner data with uniform sender names.\n"
+            "- ...\n"
+            "\nYou are a technical writer. Draft an Architecture Decision Record (ADR) for the following code change. "
+            "Summarize the context, decision, alternatives, and consequences. Use a clear, professional tone. "
+            "For the summary section, output a bullet list of decisions and consequences (not a table).\n\n"
+            f"Commit title: {commit_title}\n"
+            f"Commit body: {commit_body}\n"
+            f"Commit URL: {commit_url}\n"
+            f"Author: {author}\n"
+            f"Date: {date}\n"
+            f"Diff URL: {diff_url or 'N/A'}\n"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": adr_prompt}
+            ]
+        )
+        adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not adr_content or adr_content == "None":
+            adr_content = f"ADR for commit: {commit_title}\n\n{commit_body}"
+        # Post-process: Convert any Markdown table to a bullet list
+        adr_content = self._markdown_table_to_bullet_list(adr_content)
+        # 2. Generate a concise ADR page title
+        title_prompt = (
+            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
+            f"Content:\n{adr_content}\n"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": title_prompt}
+            ]
+        )
+        page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if page_title:
+            page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+        if not page_title or page_title.strip().lower() == "none":
+            page_title = commit_title or 'New ADR'
+        # 3. Create the ADR subpage (in UP space, parented under ADR parent page)
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+        parent_id = parent_adr_page_id or os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+        base_url = os.getenv("CONFLUENCE_BASE_URL")
+        # Confluence API: create child page by specifying ancestors
+        from theo.tools.confluence import markdown_to_confluence_storage
+        content_html = markdown_to_confluence_storage(adr_content)
+        user = os.getenv("CONFLUENCE_ADMIN_USER")
+        api_token = os.getenv("CONFLUENCE_API_TOKEN")
+        url = f"{base_url}/rest/api/content/"
+        data = {
+            "type": "page",
+            "title": page_title,
+            "ancestors": [{"id": str(parent_id)}],
+            "space": {"key": space_key},
+            "body": {
+                "storage": {
+                    "value": content_html,
+                    "representation": "storage"
+                }
+            }
+        }
+        resp = requests.post(url, json=data, auth=(user, api_token))
+        resp.raise_for_status()
+        new_page = resp.json()
+        new_page_id = new_page.get("id")
+        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id else ""
+        # 4. Add a new row to the ADR Index table
+        # Columns: Title (link), Status, Date, Authors, Source
+        date_str = date if isinstance(date, str) else datetime.utcnow().strftime("%Y-%m-%d")
+        title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
+        status_cell = '✅ Merged'
+        authors_cell = 'LLM'
+        source_cell = 'GitHub'
+        new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
+        add_row_to_adr_index(parent_id, new_row)
+        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
+
+    def update_tbikb_for_model_changes(self, changed_models, commit_info, push_date=None):
+        """
+        Summarize all .model.ts changes in a push and create/update a single TBIKB Confluence page.
+        changed_models: list of dicts with keys: path, diff_url, commit_message, etc.
+        commit_info: dict with push metadata (e.g., pusher, commit hashes, etc.)
+        push_date: optional, ISO string or datetime
+        """
+        import litellm
+        from theo.tools.confluence import create_confluence_page
+        from datetime import datetime
+        model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
+        # Build a summary prompt for all model changes
+        changes_summary = []
+        for model_file in changed_models:
+            entry = (
+                f"File: {model_file.get('path')}\n"
+                f"Commit: {model_file.get('commit_hash', 'N/A')}\n"
+                f"Commit message: {model_file.get('commit_message', '')}\n"
+                f"Diff URL: {model_file.get('diff_url', 'N/A')}\n"
+            )
+            changes_summary.append(entry)
+        summary_str = "\n---\n".join(changes_summary)
+        prompt = (
+            "IMPORTANT: Do NOT use tables. Use only a bullet list for the summary. If you use a table, your answer will be discarded.\n"
+            "For the summary section, use this format (not a table):\n"
+            "- Change: Prevent duplicate activations. Consequence: Improved data integrity.\n"
+            "- Change: Remove special characters. Consequence: Cleaner data.\n"
+            "- ...\n"
+            "\nYou are a technical writer. Summarize the following DB schema/entity changes based on the .model.ts files changed in this code push. "
+            "For each file, describe the entity, the nature of the change (added/removed/modified fields, etc.), and any impact on the database. "
+            "For the summary section, output a bullet list of changes and their consequences (not a table).\n\n"
+            f"Push info: {commit_info}\n\n"
+            f"Model changes:\n{summary_str}"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not doc_content or doc_content == "None":
+            doc_content = f"DB schema/entity changes for this push:\n\n{summary_str}"
+        # Post-process: Convert any Markdown table to a bullet list
+        doc_content = self._markdown_table_to_bullet_list(doc_content)
+        # Title: DB Schema Changes - <date or commit hash>
+        date_str = push_date or datetime.utcnow().strftime("%Y-%m-%d")
+        title = f"DB Schema Changes - {date_str}"
+        # Create/update the TBIKB page
+        confluence_response = create_confluence_page(title, doc_content, space_key=os.getenv("CONFLUENCE_SPACE_KEY_TBIKB", "TBIKB"))
+        page_id = confluence_response.get("id")
+        base_url = os.getenv("CONFLUENCE_BASE_URL")
+        confluence_url = f"{base_url}/pages/viewpage.action?pageId={page_id}" if page_id and base_url else ""
+        return {"tbikb_page_id": page_id, "tbikb_page_url": confluence_url, "tbikb_title": title}
+
+    def create_adr_from_github_push(self, commits, push_info, parent_adr_page_id=None):
+        """
+        Create a single ADR subpage and update the ADR Index table in Confluence for a GitHub push event (all commits summarized).
+        """
+        import litellm
+        from theo.tools.confluence import create_confluence_page, add_row_to_adr_index, markdown_to_confluence_storage
+        from datetime import datetime
+        import os, re
+        model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
+        # 1. Aggregate commit info
+        commit_summaries = []
+        for commit in commits:
+            commit_message = commit.get('message', '')
+            commit_title = commit_message.split('\n')[0]
+            commit_summaries.append(
+                f"Commit: {commit.get('id', '')}\nTitle: {commit_title}\nBody: {commit_message}\nURL: {commit.get('url', '')}\nAuthor: {commit.get('author', {}).get('name', 'Unknown')}\nDate: {commit.get('timestamp', '')}\n"
+            )
+        summary_str = "\n---\n".join(commit_summaries)
+        adr_prompt = (
+            "You are a technical writer. Draft a single Architecture Decision Record (ADR) summarizing the following code push. "
+            "Summarize the context, decisions, alternatives, and consequences for all included commits. Use a clear, professional tone. "
+            "Include a summary table if appropriate.\n\n"
+            f"Push info: {push_info}\n\nCommits:\n{summary_str}"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": adr_prompt}
+            ]
+        )
+        adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not adr_content or adr_content == "None":
+            adr_content = f"ADR for code push:\n\n{summary_str}"
+        # 2. Generate a concise ADR page title
+        title_prompt = (
+            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
+            f"Content:\n{adr_content}\n"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": title_prompt}
+            ]
+        )
+        page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if page_title:
+            page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+        if not page_title or page_title.strip().lower() == "none":
+            page_title = "ADR for code push"
+        # 3. Create the ADR subpage (in UP space, parented under ADR parent page)
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+        parent_id = parent_adr_page_id or os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+        base_url = os.getenv("CONFLUENCE_BASE_URL")
+        content_html = markdown_to_confluence_storage(adr_content)
+        user = os.getenv("CONFLUENCE_ADMIN_USER")
+        api_token = os.getenv("CONFLUENCE_API_TOKEN")
+        url = f"{base_url}/rest/api/content/"
+        data = {
+            "type": "page",
+            "title": page_title,
+            "ancestors": [{"id": str(parent_id)}],
+            "space": {"key": space_key},
+            "body": {
+                "storage": {
+                    "value": content_html,
+                    "representation": "storage"
+                }
+            }
+        }
+        resp = requests.post(url, json=data, auth=(user, api_token))
+        resp.raise_for_status()
+        new_page = resp.json()
+        new_page_id = new_page.get("id")
+        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id else ""
+        # 4. Add a new row to the ADR Index table
+        date_str = datetime.utcnow().isoformat()
+        title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
+        status_cell = '✅ Merged'
+        authors_cell = 'LLM'
+        source_cell = 'GitHub'
+        new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
+        add_row_to_adr_index(parent_id, new_row)
+        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
+
+    def _is_schema_change(self, diff_text):
+        """
+        Heuristic: Returns True if the diff contains likely DB schema changes (property or decorator add/remove/change).
+        """
+        import re
+        schema_patterns = [
+            r'^\+\s*@\w+',         # Added decorator
+            r'^-\s*@\w+',          # Removed decorator
+            r'^\+\s*\w+\s*[:=]', # Added property
+            r'^-\s*\w+\s*[:=]',  # Removed property
+        ]
+        for pattern in schema_patterns:
+            if re.search(pattern, diff_text, re.MULTILINE):
+                return True
+        return False
 
 # Enable LLM Observability at startup
 LLMObs.enable()
