@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
 import os
 from threading import Lock
+import requests
 
 # Initialize tracer
 from ddtrace import tracer
@@ -278,8 +279,60 @@ async def slack_events(request: Request):
     return JSONResponse({"message": "Slack event received", "supervisor_response": supervisor_response}, status_code=status.HTTP_200_OK)
 
 @app.post("/github/webhook")
-async def github_webhook(request: Request):
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
+    # Only handle push events to main or test branch
+    if payload.get("ref") in ["refs/heads/main", "refs/heads/PD-7618"] and "commits" in payload:
+        def process_github_push(payload):
+            theo = Theo()
+            parent_adr_page_id = os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+            commits = payload["commits"]
+            push_info = {
+                "pusher": payload.get("pusher", {}),
+                "after": payload.get("after"),
+                "before": payload.get("before"),
+                "ref": payload.get("ref"),
+                "repository": payload.get("repository", {}).get("full_name", "")
+            }
+            # Create a single ADR for the push
+            adr_result = theo.create_adr_from_github_push(commits, push_info, parent_adr_page_id=parent_adr_page_id)
+            # Collect all .model.ts changes across all commits
+            all_model_changes = []
+            for commit in commits:
+                commit_hash = commit.get("id", "")
+                commit_body = commit.get("message", "")
+                diff_url = commit.get("url", "") + ".diff" if commit.get("url") else None
+                for file_path in commit.get("added", []) + commit.get("modified", []) + commit.get("removed", []):
+                    if file_path.endswith(".model.ts"):
+                        all_model_changes.append({
+                            "path": file_path,
+                            "commit_hash": commit_hash,
+                            "commit_message": commit_body,
+                            "diff_url": diff_url
+                        })
+            tbikb_result = None
+            if all_model_changes:
+                # Only update TBIKB if at least one .model.ts file has a schema change
+                schema_change_detected = False
+                for model_change in all_model_changes:
+                    diff_url = model_change.get("diff_url")
+                    if diff_url:
+                        try:
+                            resp = requests.get(diff_url)
+                            if resp.ok:
+                                diff_text = resp.text
+                                if theo._is_schema_change(diff_text):
+                                    schema_change_detected = True
+                                    break
+                        except Exception as e:
+                            print(f"[ERROR] Could not fetch diff for {diff_url}: {e}")
+                if schema_change_detected:
+                    push_date = payload.get("head_commit", {}).get("timestamp") or None
+                    tbikb_result = theo.update_tbikb_for_model_changes(all_model_changes, push_info, push_date=push_date)
+            # Optionally log or store results
+        background_tasks.add_task(process_github_push, payload)
+        return JSONResponse({"message": "Processing GitHub push in background"}, status_code=status.HTTP_200_OK)
+    # Fallback: default supervisor handling for other events
     conversation_id = payload.get("thread_id") or payload.get("issue", {}).get("id") or payload.get("pull_request", {}).get("id")
     with tracer.trace("conversation.workflow", service="theo", resource="github_event") as parent_span:
         parent_span.set_tag("conversation.id", conversation_id)
