@@ -67,9 +67,11 @@ def create_confluence_page(title, content, space_key=None):
     url = f"{base_url}/rest/api/content/"
     # Convert Markdown to Confluence storage format (HTML)
     content_html = markdown_to_confluence_storage(content)
+    MAX_TITLE_LENGTH = 255
+    page_title = title[:MAX_TITLE_LENGTH]
     data = {
         "type": "page",
-        "title": title,
+        "title": page_title,
         "space": {"key": space_key},
         "body": {
             "storage": {
@@ -83,8 +85,8 @@ def create_confluence_page(title, content, space_key=None):
         from theo.tools.confluence import get_all_confluence_pages, update_confluence_page
         all_pages = get_all_confluence_pages(space_key=space_key)
         for page in all_pages:
-            if page["title"].strip().lower() == title.strip().lower():
-                print(f"[DEBUG] Page with title '{title}' already exists (id={page['id']}), updating instead of creating.")
+            if page["title"].strip().lower() == page_title.strip().lower():
+                print(f"[DEBUG] Page with title '{page_title}' already exists (id={page['id']}), updating instead of creating.")
                 return update_confluence_page(page["id"], content)
     except Exception as e:
         print(f"[ERROR] Error checking for duplicate title: {e}")

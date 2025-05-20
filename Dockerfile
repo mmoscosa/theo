@@ -31,14 +31,14 @@ COPY .env .env
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Copy test_llm.py
-COPY test_llm.py /app/test_llm.py
-
 # Expose the FastAPI port
 EXPOSE 8000
 
 # Set environment variables
 ENV PYTHONPATH=/app/src
+
+# Copy the secret key
+COPY secrets/gcp-vertex.json /app/secrets/gcp-vertex.json
 
 # Use entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"] 

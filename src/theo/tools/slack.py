@@ -104,4 +104,17 @@ def fetch_thread_history(channel, thread_ts):
     if not response.ok or not response.json().get("ok"):
         print(f"[Slack] Failed to fetch thread history: {response.text}")
         return []
-    return response.json().get("messages", []) 
+    return response.json().get("messages", [])
+
+def get_last_user_message_ts(thread_history, bot_user_id=None):
+    """Return the timestamp of the last user (non-bot) message in the thread."""
+    if not thread_history:
+        return None
+    if bot_user_id is None:
+        bot_user_id = os.getenv("SLACK_BOT_USER_ID")
+    # Filter out bot messages
+    user_msgs = [msg for msg in thread_history if not msg.get("bot_id") and msg.get("user") != bot_user_id]
+    if not user_msgs:
+        return None
+    # Return the ts of the last user message
+    return user_msgs[-1].get("ts") 

@@ -93,6 +93,14 @@ class Theo():
             verbose=True
         )
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.supervisor_model = os.getenv("AGENT_SUPERVISOR_MODEL", "gemini/gemini-2.5-pro-exp-03-25")
+        self.support_engineer_model = os.getenv("AGENT_SUPPORT_ENGINEER_MODEL", "anthropic/claude-3-5-sonnet-20240620")
+        self.technical_writer_model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "gpt-4o")
+        self.bi_engineer_model = os.getenv("AGENT_BI_ENGINEER_MODEL", "openai/o3")
+        self.product_manager_model = os.getenv("AGENT_PRODUCT_MANAGER_MODEL", "gemini/gemini-2.5-pro-exp-03-25")
+
     def summarize_thread(self, thread_history, question=None):
         """Summarize a Slack thread using the supervisor's LLM model, and include relevant general knowledge from Bedrock only if useful."""
         model = os.getenv("AGENT_SUPERVISOR_MODEL", "unknown")
@@ -178,6 +186,9 @@ class Theo():
             "answer": answer_clean,
             "conversation_id": conversation_id
         })
+        # If supervisor_health, return the tuple directly
+        if answer_clean == "supervisor_health":
+            return result
         # For bi_report and documentation_update, pass both summary and raw thread
         if answer_clean == "bi_report" or answer_clean == "documentation_update":
             print(f"[DEBUG] Passing to downstream agent: answer={answer_clean}, context_summary={context_summary}, thread_history={thread_history}")
@@ -484,7 +495,7 @@ class Theo():
         agent_emoji = "👨‍💻"
         category_emoji = "📄"
         category_title = "Support Request"
-        model = os.getenv("AGENT_SUPPORT_ENGINEER_MODEL", "gpt-4o")
+        model = self.support_engineer_model
         model_provider = get_model_provider("AGENT_SUPPORT_ENGINEER_MODEL", "AGENT_SUPPORT_ENGINEER_PROVIDER")
         context_summary_clean = "" if context_summary in (None, "None") else context_summary
         docs = bedrock.search_code_documentation(question)
@@ -530,12 +541,76 @@ class Theo():
             agent_emoji=agent_emoji
         )
 
-    def supervisor_answer(self, question, conversation_id=None, context_summary=None):
-        agent_role = "supervisor"
+    def _is_heartbeat_question(self, question):
+        import litellm
+        if not question:
+            return False
         model = os.getenv("AGENT_SUPERVISOR_MODEL", "gpt-4o")
+        prompt = (
+            "A user sent the following message:\n"
+            f"\"{question.strip()}\"\n"
+            "Is this message asking if the platform, system, or bot is online, working, alive, available, or requesting a status/heartbeat check? "
+            "Respond with only 'yes' or 'no'."
+        )
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are an intent classifier."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            answer = response['choices'][0]['message']['content'].strip().lower()
+            return answer.startswith("yes")
+        except Exception:
+            return False
+
+    def supervisor_answer(self, question, conversation_id=None, context_summary=None):
+        from theo.tools.slack import format_slack_response
+        agent_role = "Supervisor"
+        agent_emoji = ":shield:"
+        category_emoji = ":satellite_antenna:"
+        category_title = "Platform Health"
+        model = self.supervisor_model
         model_provider = get_model_provider("AGENT_SUPERVISOR_MODEL", "AGENT_SUPERVISOR_PROVIDER")
         context_summary = context_summary or ""
         valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "clarification_needed"}
+
+        # Heartbeat/health check interception
+        if self._is_heartbeat_question(question):
+            import litellm
+            from ddtrace.llmobs import LLMObs
+            # Use LLM to generate a friendly confirmation
+            prompt = (
+                "A user asked if the platform is working, online, or available. "
+                "Respond with a short, friendly confirmation that the system is up and running. "
+                "Do not mention being an AI or bot. Format for Slack."
+            )
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else "Yes, the platform is up and running!"
+                LLMObs.annotate(
+                    input_data=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}],
+                    output_data=[{"role": "assistant", "content": main_content}],
+                    tags={"agent_role": agent_role, "model_provider": model_provider, "action": "heartbeat_response"}
+                )
+            except Exception as e:
+                main_content = "Yes, the platform is up and running!"
+            slack_message = format_slack_response(
+                category_emoji=category_emoji,
+                category_title=category_title,
+                main_content=main_content,
+                agent_role=agent_role,
+                agent_emoji=agent_emoji
+            )
+            # Return a special marker so the router knows not to pass to other agents
+            return ("supervisor_health", slack_message)
         prompt = (
             "You are an agent router. Your job is to select the most appropriate agent for each user request, based on the intent of the message.\n"
             "\n"
@@ -609,7 +684,7 @@ class Theo():
         agent_emoji = "📝"
         category_emoji = "📚"
         category_title = "Documentation Update"
-        model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
+        model = self.technical_writer_model
         @llm(model_name=model, name="technical_writer_answer", model_provider="anthropic")
         def _llm_call():
             # Use the raw thread only as part of the LLM prompt, not in the Slack message
@@ -656,7 +731,7 @@ class Theo():
         agent_emoji = "📊"
         category_emoji = "📈"
         category_title = "BI Report"
-        model = os.getenv("AGENT_BI_ENGINEER_MODEL", "unknown")
+        model = self.bi_engineer_model
         model_provider = get_model_provider("AGENT_BI_ENGINEER_MODEL", "AGENT_BI_ENGINEER_PROVIDER")
         bedrock = BedrockClient()
         db_docs = bedrock.search_db_schema(question)
@@ -788,7 +863,7 @@ class Theo():
         agent_emoji = "📝"
         category_emoji = "📝"
         category_title = "Ticket Creation"
-        model = os.getenv("AGENT_PRODUCT_MANAGER_MODEL", "gpt-4o")
+        model = self.product_manager_model
         model_provider = get_model_provider("AGENT_PRODUCT_MANAGER_MODEL", "AGENT_PRODUCT_MANAGER_PROVIDER")
         admin_slack_user_id = os.getenv("ADMIN_SLACK_USER_ID")
         admin_tag = f"<@{admin_slack_user_id}> " if admin_slack_user_id else ""
