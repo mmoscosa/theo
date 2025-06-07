@@ -774,6 +774,8 @@ class Theo():
                 json_pattern = re.compile(r'(\{\s*\n(?:[^\n]*\n)+?\})', re.MULTILINE)
                 def replacer(match):
                     code = match.group(1)
+                    # Remove any language hint from code block if present
+                    code = re.sub(r'^```[a-zA-Z]+\n', '```\n', code, flags=re.MULTILINE)
                     # Only wrap if not already in a code block
                     if not code.strip().startswith('```'):
                         return f'```
