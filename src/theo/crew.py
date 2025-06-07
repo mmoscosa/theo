@@ -761,8 +761,23 @@ class Theo():
             print(f"[DEBUG] LLM raw output: {main_content}")
             main_content = markdown_to_slack(main_content)
             
-            # Add source citations if available
-            if sources and any(source for source in sources if source):
+            # Suppress sources if answer is general knowledge or not found in docs
+            general_knowledge_phrases = [
+                "no direct mention in provided documentation",
+                "general knowledge",
+                "not found in documentation",
+                "not found in docs",
+                "no documentation found",
+                "no relevant documentation",
+                "not available in documentation"
+            ]
+            if any(phrase in main_content.lower() for phrase in general_knowledge_phrases):
+                # Remove any existing Sources lines
+                import re
+                sources_pattern = r'Sources:\s*(<[^>]+\|\[[0-9]+\]>\s*)*|Sources:\s*(\[[0-9,\s\[\]]+\]|\[[0-9]+\](?:\s*\[[0-9]+\])*)'
+                main_content = re.sub(sources_pattern, "", main_content)
+                print(f"[DEBUG] Suppressed all source links due to general knowledge answer")
+            elif sources and any(source for source in sources if source):
                 valid_sources = [source for source in sources if source and source != "[No content in results]"]
                 print(f"[DEBUG] Valid sources found: {valid_sources}")
                 if valid_sources:
@@ -770,18 +785,13 @@ class Theo():
                     for i, source in enumerate(valid_sources, 1):
                         print(f"[DEBUG] Processing source {i}: {source}")
                         if source and source.startswith("http"):
-                            # Keep sources as simple numbered brackets: [1] [2] [3]
                             source_links.append(f"<{source}|[{i}]>")
                             print(f"[DEBUG] Added HTTP link: <{source}|[{i}]>")
                         else:
-                            # It's an S3 URI or other reference
                             source_links.append(f"[{i}]")
                             print(f"[DEBUG] Added non-HTTP reference: [{i}] for source: {source}")
-                    
                     if source_links:
-                        # Replace the LLM's "Sources: [1]" pattern with our clickable version
                         import re
-                        # Find and replace the existing Sources line if it exists
                         sources_pattern = r'Sources:\s*(\[[0-9,\s\[\]]+\]|\[[0-9]+\](?:\s*\[[0-9]+\])*)'
                         if re.search(sources_pattern, main_content):
                             main_content = re.sub(sources_pattern, f"Sources: {' '.join(source_links)}", main_content)
@@ -791,13 +801,11 @@ class Theo():
                             print(f"[DEBUG] Added new sources line: Sources: {' '.join(source_links)}")
             else:
                 print(f"[DEBUG] No valid sources to display")
-                # Remove any placeholder source citations when no valid sources exist
                 import re
                 sources_pattern = r'Sources:\s*(\[[0-9,\s\[\]]+\]|\[[0-9]+\](?:\s*\[[0-9]+\])*)'
                 if re.search(sources_pattern, main_content):
                     main_content = re.sub(sources_pattern, "Sources: None found", main_content)
                     print(f"[DEBUG] Replaced placeholder sources with 'Sources: None found'")
-                # Also check for just "Sources: [1]" pattern specifically
                 elif "Sources: [1]" in main_content:
                     main_content = main_content.replace("Sources: [1]", "Sources: None found")
                     print(f"[DEBUG] Replaced 'Sources: [1]' with 'Sources: None found'")
