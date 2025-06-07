@@ -3,7 +3,9 @@ set -e
 
 # Load environment variables from .env
 echo "Loading environment variables from .env..."
-export $(grep -v '^#' /app/.env | xargs)
+set -a
+source <(grep -v '^#' /app/.env | grep -v '^$' | sed 's/#.*//')
+set +a
 
 # Print Datadog related environment variables for debugging
 echo "DD_TRACE_AGENTLESS: $DD_TRACE_AGENTLESS"

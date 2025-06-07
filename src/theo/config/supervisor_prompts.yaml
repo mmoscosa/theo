@@ -2,27 +2,71 @@
 # Use {placeholders} for variables to be filled in at runtime.
 
 routing_actions:
-  support_request: "Support Engineer: for support, help, troubleshooting, or technical questions"
-  documentation_update: "Technical Writer: for documentation requests or updates"
-  adr_creation: "Technical Writer: for ADR creation (only when user explicitly requests 'create ADR', 'new ADR', or 'architecture decision record')"
+  support_request: "Support Engineer: for support, help, troubleshooting, technical questions, or 'how to' questions (e.g., 'how do I...', 'how does...', 'how can we...')"
+  documentation_update: "Technical Writer: for documentation requests or when user wants to remember/store information (e.g., 'document this', 'create docs', 'update documentation', 'remember this', 'remember that', 'store this')"
+  adr_creation: "Technical Writer: for ADR creation (when user mentions 'ADR', 'adr', 'create ADR', 'new ADR', 'build an ADR', 'architecture decision record', or wants to create any architectural decision document)"
+  documentation_and_adr: "Technical Writer: when user explicitly requests BOTH documentation AND ADR creation (e.g., 'create a document and adr', 'document this and create an adr', 'both docs and adr')"
   bi_report: "BI Engineer: for reports, analytics, SQL, or data questions"
   ticket_creation: "Product Manager: for tickets, issues, or feature requests"
   platform_health: "Supervisor: for platform health, heartbeat, or status checks (e.g., 'you up?', 'are you there?', 'is the system online?')"
   clarification_needed: "If you are unsure or the request is ambiguous, respond with: clarification_needed"
 
 routing_prompt: |
-  You are the Supervisor agent. Your job is to decide which agent should handle the following user request. Use the following action list:
-  {routing_actions}
+  You are the Supervisor agent. Your job is to decide which agent should handle the following user request.
 
   User request: "{user_message}"
-  Conversation context (summarized thread):
-  {context_summary}
+  Conversation context: {context_summary}
 
-  IMPORTANT: 
-  - If the user explicitly asks to "create ADR", "new ADR", or mentions "architecture decision record", route to adr_creation.
-  - If the user asks about tickets, sprints, the board, or anything related to Jira, ticket status, or planning (e.g., 'do we have a ticket', 'is there a ticket', 'what's in the sprint', 'what's on the board'), always route to the Product Manager (ticket_creation). The Product Manager is the expert for these topics.
+  **CRITICAL: RESPOND WITH EXACTLY ONE ACTION ONLY. DO NOT COMBINE ACTIONS UNLESS EXPLICITLY REQUESTED.**
 
-  Respond ONLY with one of: support_request, documentation_update, adr_creation, bi_report, ticket_creation, platform_health, clarification_needed.
+  **STEP 1: CHECK FOR BOTH DOCUMENTATION AND ADR FIRST**
+  ONLY if user explicitly mentions BOTH documentation/docs AND adr in the SAME request:
+  - Contains "document" + "adr" → respond "documentation_and_adr"
+  - Contains "docs" + "adr" → respond "documentation_and_adr"  
+  - Contains "both" + ("doc" or "adr") → respond "documentation_and_adr"
+  - Contains "create documentation and adr" → respond "documentation_and_adr"
+
+  **STEP 2: CHECK FOR ADR KEYWORDS ONLY (NO OTHER ACTIONS)**
+  If user mentions ADR but NOT documentation:
+  - Contains "adr" (but not "document") → respond "adr_creation"
+  - Contains "ADR" (but not "document") → respond "adr_creation"
+  - Contains "build an adr" → respond "adr_creation"
+  - Contains "create adr" → respond "adr_creation"
+  - Contains "architecture decision" → respond "adr_creation"
+
+  **STEP 3: CHECK FOR TICKET KEYWORDS ONLY (NO OTHER ACTIONS)**
+  ONLY if user explicitly asks for ticket creation:
+  - Contains "create ticket" → respond "ticket_creation"
+  - Contains "new ticket" → respond "ticket_creation"
+  - Contains "make ticket" → respond "ticket_creation"
+  - Contains "jira ticket" → respond "ticket_creation"
+
+  **STEP 4: If no specific keywords, then check other routing:**
+  - support_request: for help, how-to questions, asking for suggestions/recommendations, technical support (e.g., "what do you suggest?", "how should we...", "what's the best way...")
+  - documentation_update: when asking to document/remember/store information (e.g., "document this", "remember this", "store this")
+  - bi_report: for data, analytics, reports, SQL questions
+  - ticket_creation: ONLY when explicitly asking to "create ticket", "new ticket", "make a ticket"
+  - platform_health: for system status checks
+
+  **POSITIVE Examples (DO respond with these):**
+  "create a document and adr around this" → documentation_and_adr (both explicitly mentioned)
+  "lets build an adr" → adr_creation (contains "adr", no document mention)
+  "create the adr" → adr_creation (contains "adr", no document mention)
+  "remember this" → documentation_update (wants to store information)
+  "document this conversation" → documentation_update (wants to store information)
+  "how do we use the API?" → support_request (asking for help)
+  "what's the best approach for..." → support_request (asking for recommendations)
+  "create a ticket for this" → ticket_creation (explicitly asking for ticket)
+  "new jira ticket needed" → ticket_creation (explicitly asking for ticket)
+
+  **NEGATIVE Examples (DO NOT respond with these - use clarification_needed instead):**
+  "create adr and ticket" → clarification_needed (ambiguous, multiple actions)
+  "document this and make a ticket" → clarification_needed (ambiguous, multiple actions)
+  "adr or documentation?" → clarification_needed (user is asking for choice)
+  "should we create docs?" → clarification_needed (asking for recommendation, not action)
+  "maybe an adr would help" → clarification_needed (suggestion, not direct request)
+
+  Respond ONLY with: documentation_and_adr, adr_creation, support_request, documentation_update, bi_report, ticket_creation, platform_health, or clarification_needed
 
 summary_prompt: |
   You are an expert assistant summarizing a Slack thread for an AI agent router.

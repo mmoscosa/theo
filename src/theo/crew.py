@@ -221,8 +221,8 @@ class Theo():
         # If supervisor_health, return the tuple directly
         if answer_clean in ("supervisor_health", "platform_health"):
             return result
-        # For bi_report, documentation_update, and adr_creation, pass both summary and raw thread
-        if answer_clean in ["bi_report", "documentation_update", "adr_creation"]:
+        # For bi_report, documentation_update, adr_creation, and documentation_and_adr, pass both summary and raw thread
+        if answer_clean in ["bi_report", "documentation_update", "adr_creation", "documentation_and_adr"]:
             print(f"[DEBUG] Passing to downstream agent: answer={answer_clean}, context_summary={context_summary}, thread_history={thread_history}")
             return {
                 "task_name": answer_clean,
@@ -230,6 +230,10 @@ class Theo():
                 "context_summary": context_summary,
                 "thread_history": thread_history
             }
+        # Handle clarification_needed
+        elif answer_clean == "clarification_needed":
+            return f"I need more information to help you properly. Could you please clarify what you're looking for or provide more context about your request?"
+        
         # For all other agents, pass only context_summary
         else:
             print(f"[DEBUG] Passing to downstream agent: answer={answer_clean}, context_summary only")
@@ -318,6 +322,14 @@ class Theo():
             doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if not doc_content or doc_content == "None":
                 doc_content = "Documentation could not be generated."
+            
+            # Validate content completion and strip EOF marker
+            if "~EOF~" in doc_content:
+                doc_content = doc_content.replace("~EOF~", "").strip()
+                print(f"[DEBUG] Documentation content completed successfully (EOF marker found)")
+            else:
+                print(f"[WARNING] Documentation content may be truncated (no EOF marker found)")
+                doc_content += "\n\n*Note: This documentation may be incomplete due to generation limits.*"
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": doc_prompt}],
                 output_data=[{"role": "assistant", "content": doc_content}],
@@ -340,6 +352,19 @@ class Theo():
             page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if page_title:
                 page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+                # Clean up common LLM response patterns for title generation
+                page_title = re.sub(r'^Here are.*?options.*?title.*?:', '', page_title, flags=re.IGNORECASE | re.DOTALL).strip()
+                page_title = re.sub(r'^\d+\.\s*[\*\*]*', '', page_title).strip()  # Remove numbering like "1. **"
+                page_title = re.sub(r'^\*\*([^*]+)\*\*.*', r'\1', page_title).strip()  # Extract just bold title
+                page_title = re.sub(r'^([^.\n]+)\..*', r'\1', page_title, flags=re.DOTALL).strip()  # Take first sentence
+                # If still too long or contains explanation text, take first meaningful part
+                if len(page_title) > 80 or any(word in page_title.lower() for word in ['here are', 'options', 'why:', 'reason:']):
+                    lines = page_title.split('\n')
+                    for line in lines:
+                        clean_line = re.sub(r'^\d+\.\s*[\*\*]*(.+?)[\*\*]*$', r'\1', line.strip())
+                        if clean_line and len(clean_line) < 80 and not any(word in clean_line.lower() for word in ['here are', 'options', 'why:', 'reason:']):
+                            page_title = clean_line
+                            break
             if not page_title or page_title.strip().lower() == "none":
                 page_title = question or 'New Documentation'
             LLMObs.annotate(
@@ -502,11 +527,14 @@ class Theo():
         # Format the response message
         page_title = adr_result.get("adr_title", "New ADR")
         page_url = adr_result.get("adr_page_url", "")
+        authors_info = adr_result.get("authors_info", "Unknown")
         
         slack_message = (
-            f":memo: **ADR Created**\n\n"
-            f"Architecture Decision Record <{page_url}|{page_title}> has been created and added to the [ADR Index](https://sunroom.atlassian.net/wiki/spaces/UP/pages/2117566465/Architecture+Decision+Record+ADR#%F0%9F%93%84-ADR-Index).\n\n"
-            f"_Taken by 📝 Technical Writer_"
+            f":memo: *ADR Created*\n\n"
+            f"Architecture Decision Record <{page_url}|{page_title}> has been created and added to the ADR Index.\n\n"
+            f"*Status:* Proposed\n"
+            f"*Contributors:* {authors_info}\n\n"
+            f"_Taken by :memo: Technical Writer_"
         )
         
         print(f"[DEBUG] adr_creation result: {slack_message}")
@@ -515,6 +543,62 @@ class Theo():
             "question": question,
             "adr_title": page_title,
             "adr_url": page_url,
+            "conversation_id": conversation_id
+        })
+        return slack_message
+
+    def documentation_and_adr(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
+        """
+        Create both documentation AND an ADR based on a conversation/request.
+        """
+        print(f"[DEBUG] documentation_and_adr called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}, kwargs={kwargs}")
+        datadog = DatadogClient()
+        
+        # Create documentation first
+        doc_result = self.documentation_update(
+            question=question,
+            conversation_id=conversation_id,
+            context_summary=context_summary,
+            thread_history=thread_history,
+            close_conversation=False,  # This is a documentation prompt, not a conversation close
+            **kwargs
+        )
+        
+        # Create ADR second
+        adr_result = self.create_adr_from_conversation(
+            question=question,
+            conversation_id=conversation_id,
+            context_summary=context_summary,
+            thread_history=thread_history,
+            **kwargs
+        )
+        
+        # Format combined response message
+        adr_title = adr_result.get("adr_title", "New ADR")
+        adr_url = adr_result.get("adr_page_url", "")
+        authors_info = adr_result.get("authors_info", "Unknown")
+        
+        # Extract documentation URL from doc_result (it's in the format of slack message)
+        doc_url_match = re.search(r'<([^|>]+)\|([^>]+)>', doc_result) if isinstance(doc_result, str) else None
+        doc_url = doc_url_match.group(1) if doc_url_match else ""
+        doc_title = doc_url_match.group(2) if doc_url_match else "Documentation"
+        
+        slack_message = (
+            f":books: *Documentation & ADR Created*\n\n"
+            f"Documentation: <{doc_url}|{doc_title}>\n"
+            f"ADR: <{adr_url}|{adr_title}> (added to ADR Index)\n\n"
+            f"*ADR Status:* Proposed\n"
+            f"*Contributors:* {authors_info}\n\n"
+            f"_Taken by :memo: Technical Writer_"
+        )
+        
+        print(f"[DEBUG] documentation_and_adr result: {slack_message}")
+        datadog.log_audit_event({
+            "event_type": "documentation_and_adr",
+            "question": question,
+            "doc_url": doc_url,
+            "adr_title": adr_title,
+            "adr_url": adr_url,
             "conversation_id": conversation_id
         })
         return slack_message
@@ -593,6 +677,11 @@ class Theo():
             main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
                 main_content = self.support_prompts["no_answer_found"]
+            
+            # Validate: Support agent should not create tickets or documentation
+            if any(phrase in main_content.lower() for phrase in ['create ticket', 'jira ticket', 'new ticket', 'i will create', 'creating documentation']):
+                print(f"[ERROR] Support agent tried to create tickets/docs: {main_content[:100]}...")
+                main_content = "I can help with technical support questions. For ticket creation or documentation, please ask explicitly for those services."
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": agent_role}, {"role": "user", "content": llm_prompt}],
                 output_data=[{"role": "assistant", "content": main_content}],
@@ -644,7 +733,7 @@ class Theo():
         model = self.supervisor_model
         model_provider = get_model_provider("AGENT_SUPERVISOR_MODEL", "AGENT_SUPERVISOR_PROVIDER")
         context_summary = context_summary or ""
-        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
+        valid_tasks = {"support_request", "documentation_update", "adr_creation", "documentation_and_adr", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
 
         # Heartbeat/health check interception
         if self._is_heartbeat_question(question):
@@ -677,13 +766,9 @@ class Theo():
             )
             # Always return both keys for compatibility
             return ("platform_health", slack_message)
-        # Format routing_actions for prompt injection
-        routing_actions_dict = self.supervisor_prompts.get("routing_actions", {})
-        routing_actions_str = "\n".join([f"- {k}: {v}" for k, v in routing_actions_dict.items()])
         prompt = self.supervisor_prompts["routing_prompt"] \
             .replace('{user_message}', question or '') \
-            .replace('{context_summary}', context_summary or '') \
-            .replace('{routing_actions}', routing_actions_str)
+            .replace('{context_summary}', context_summary or '')
         print(f"[DEBUG] Supervisor LLM full prompt:\n{prompt}")
         import litellm
         from ddtrace.llmobs import LLMObs
@@ -691,17 +776,21 @@ class Theo():
             response = litellm.completion(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "You are an agent router."},
+                    {"role": "system", "content": "You are an agent router. You must respond with exactly one valid routing option."},
                     {"role": "user", "content": prompt}
                 ]
             )
             answer = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if answer:
                 answer = answer.strip().lower()
+                # Additional validation: ensure single action
+                if ' and ' in answer or ',' in answer or '\n' in answer:
+                    print(f"[ERROR] LLM tried to return multiple actions: {answer}")
+                    answer = "clarification_needed"
             else:
                 answer = "clarification_needed"
             LLMObs.annotate(
-                input_data=[{"role": "system", "content": "You are an agent router."}, {"role": "user", "content": prompt}],
+                input_data=[{"role": "system", "content": "You are an agent router. You must respond with exactly one valid routing option."}, {"role": "user", "content": prompt}],
                 output_data=[{"role": "assistant", "content": answer}],
                 tags={"agent_role": agent_role, "model_provider": model_provider}
             )
@@ -714,13 +803,25 @@ class Theo():
             answer = "clarification_needed"
         if answer == "clarification_needed" and context_summary:
             lowered_context = context_summary.lower()
-            ticket_keywords = ["ticket", "jira", "sprint", "board", "issue", "story", "bug", "hotfix", "task"]
-            if any(kw in lowered_context for kw in ticket_keywords) or any(kw in (question or '').lower() for kw in ticket_keywords):
-                print("[DEBUG] Heuristic fallback: context indicates ticket/board/sprint, overriding to ticket_creation")
+            lowered_question = (question or '').lower()
+            
+            # Only override if the CURRENT QUESTION explicitly mentions ticket-related keywords
+            explicit_ticket_keywords = ["create ticket", "new ticket", "make ticket", "ticket for", "jira ticket"]
+            current_ticket_request = any(kw in lowered_question for kw in explicit_ticket_keywords)
+            
+            # Only override for support if current question is clearly a support question
+            support_question_patterns = ["how to", "how do", "what is", "why", "where", "when", "how can"]
+            current_support_question = any(pattern in lowered_question for pattern in support_question_patterns)
+            
+            if current_ticket_request:
+                print(f"[DEBUG] Heuristic fallback: current question explicitly requests ticket creation, overriding to ticket_creation")
                 answer = "ticket_creation"
-            elif ("support request" in lowered_context or "troubleshoot" in lowered_context or "error" in lowered_context or "help" in lowered_context):
-                print("[DEBUG] Heuristic fallback: context indicates support, overriding to support_request")
+            elif current_support_question:
+                print(f"[DEBUG] Heuristic fallback: current question is a support question, overriding to support_request")
                 answer = "support_request"
+            else:
+                print(f"[DEBUG] Keeping clarification_needed - no clear override pattern detected")
+                # Keep as clarification_needed if no clear pattern
         downstream_prompt = f"Conversation context (summarized thread):\n{context_summary}\n\nUser request: {question}"
         if answer == "platform_health":
             # Always use the heartbeat response for platform health
@@ -763,9 +864,21 @@ class Theo():
                 f"Generate a clear, user-friendly documentation update or summary for the user."
             )
             print(f"[DEBUG] technical_writer_answer LLM prompt: {llm_prompt}")
-            main_content = LLMObs.annotate(
-                input_data=[{"role": "user", "content": llm_prompt}],
-                output_data=[{"role": "assistant", "content": ""}],
+            import litellm
+            from ddtrace.llmobs import LLMObs
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a technical writer."},
+                    {"role": "user", "content": llm_prompt}
+                ]
+            )
+            main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+            if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
+                main_content = "I apologize, but I couldn't generate a proper response. Please try rephrasing your request."
+            LLMObs.annotate(
+                input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": llm_prompt}],
+                output_data=[{"role": "assistant", "content": main_content}],
                 tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": "anthropic"}
             )
             print(f"[DEBUG] technical_writer_answer LLM main_content: {main_content}")
@@ -876,14 +989,19 @@ class Theo():
                         .replace("{timeline}", timeline_str)
                     llm_prompt += "\n\n" + self.bi_engineer_prompts["business_analysis_template"]
                     print(f"[DEBUG] bi_engineer_answer LLM prompt: {llm_prompt}")
-                    main_content = LLMObs.annotate(
-                        input_data=[{"role": "user", "content": llm_prompt}],
-                        output_data=[{"role": "assistant", "content": ""}],
+                    response = litellm.completion(
+                        model=model,
+                        messages=[{"role": "system", "content": agent_role}, {"role": "user", "content": llm_prompt}]
+                    )
+                    main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                    if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
+                        main_content = self.bi_engineer_prompts["no_schema_found"]
+                    LLMObs.annotate(
+                        input_data=[{"role": "system", "content": agent_role}, {"role": "user", "content": llm_prompt}],
+                        output_data=[{"role": "assistant", "content": main_content}],
                         tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
                     )
                     print(f"[DEBUG] bi_engineer_answer LLM main_content: {main_content}")
-                    if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                        main_content = self.bi_engineer_prompts["no_schema_found"]
             slack_message = format_slack_response(
                 category_emoji=category_emoji,
                 category_title=category_title,
@@ -899,6 +1017,7 @@ class Theo():
         import litellm
         from theo.tools.jira import create_jira_ticket
         from theo.tools.slack import send_slack_message
+        from theo.tools.confluence import get_confluence_page_by_id
         import logging
         import re
         import json
@@ -909,6 +1028,17 @@ class Theo():
         category_title = "Ticket Creation"
         model = self.product_manager_model
         model_provider = get_model_provider("AGENT_PRODUCT_MANAGER_MODEL", "AGENT_PRODUCT_MANAGER_PROVIDER")
+
+        # Fetch live Jira ticket templates from Confluence
+        jira_templates = ""
+        try:
+            jira_templates_page_id = os.getenv("CONFLUENCE_JIRA_TEMPLATES_PAGE_ID", "2123857921")
+            template_page = get_confluence_page_by_id(jira_templates_page_id)
+            jira_templates = template_page["body"]["storage"]["value"]
+            print(f"[DEBUG] Successfully fetched Jira templates from Confluence page {jira_templates_page_id}")
+        except Exception as e:
+            print(f"[ERROR] Could not fetch Jira templates from Confluence: {e}")
+            jira_templates = "Use standard Jira best practices for ticket creation."
 
         def get_ticket_type_and_summary(question):
             # Build conversation timeline with timestamps for context
@@ -926,10 +1056,13 @@ class Theo():
             
             base_prompt = self.product_manager_prompts.get('ticket_creation', '')
             
+            # Include live Jira templates in the prompt
+            full_prompt = f"{base_prompt}\n\nLive Jira Templates from Confluence:\n{jira_templates}\n\nConversation History:\n{timeline_str}\n\nCurrent Request: {question}"
+            
             # First pass: Get ticket type and initial structure
             messages = [
                 {"role": "system", "content": "You are a Product Manager. You MUST respond with ONLY valid JSON. No explanations, no markdown, just pure JSON."},
-                {"role": "user", "content": f"{base_prompt}\n\nConversation History:\n{timeline_str}\n\nCurrent Request: {question}"}
+                {"role": "user", "content": full_prompt}
             ]
             
             try:
@@ -1045,6 +1178,11 @@ class Theo():
             for i, question in enumerate(questions, 1):
                 response += f"{i}. {question}\n"
             return response
+        
+        # Validate: Product Manager should only create tickets
+        if not ticket_data.get("type") or not ticket_data.get("summary"):
+            print(f"[ERROR] Product Manager did not generate valid ticket data: {ticket_data}")
+            return f"❌ Error: Could not generate a valid ticket. Please provide more specific information about what ticket you need."
             
         try:
             # Prepare the description and append Slack link if available
@@ -1126,7 +1264,7 @@ class Theo():
             return '\n'.join(new_lines)
         return md_text
 
-    def create_code_commit_from_github(self, commit_title, commit_body, commit_url, author, date, diff_url=None, parent_folder_id=None):
+    def create_code_commit_from_github(self, commit_title, commit_body, commit_url, author, date, diff_url=None, parent_folder_id=None, branch_name=None):
         """
         Create a new Code Commit page in Confluence based on a GitHub merge to main.
         """
@@ -1158,8 +1296,15 @@ class Theo():
             commit_content = f"Code Commit Summary: {commit_title}\n\n{commit_body}"
         # 2. Generate a concise page title
         title_prompt = (
-            "Given the following code commit content, generate a concise, descriptive Confluence page title.\n\n"
-            f"Content:\n{commit_content}\n"
+            "Generate a single, concise Confluence page title for this code commit. "
+            "Return ONLY the title, no explanations, no options, no numbering.\n\n"
+            f"Commit title: {commit_title}\n"
+            f"Content:\n{commit_content}\n\n"
+            "Examples of good titles:\n"
+            "- Fix user authentication bug in login module\n"
+            "- Add Redis caching to product API\n" 
+            "- Update database schema for orders table\n\n"
+            "Title:"
         )
         response = litellm.completion(
             model=model,
@@ -1171,8 +1316,35 @@ class Theo():
         page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
         if page_title:
             page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+            # Remove "Title:" prefix if present
+            page_title = re.sub(r'^Title:\s*', '', page_title, flags=re.IGNORECASE).strip()
+            # Remove explanatory LLM response patterns
+            page_title = re.sub(r'^Here are.*?options.*?:', '', page_title, flags=re.IGNORECASE | re.DOTALL).strip()
+            page_title = re.sub(r'^\d+\.\s*', '', page_title).strip()  # Remove numbering like "1. "
+            page_title = re.sub(r'^[a-zA-Z]+:\s*', '', page_title).strip()  # Remove "Why:" etc.
+            # Remove markdown formatting from title
+            page_title = re.sub(r'\*\*([^*]+)\*\*', r'\1', page_title)  # Remove **bold**
+            page_title = re.sub(r'\*([^*]+)\*', r'\1', page_title)      # Remove *italic*
+            page_title = re.sub(r'`([^`]+)`', r'\1', page_title)        # Remove `code`
+            # Take only the first line if multi-line
+            page_title = page_title.split('\n')[0].strip()
+            # If still contains explanatory text, extract the actual title
+            if len(page_title) > 100 or any(word in page_title.lower() for word in ['here are', 'options', 'why:', 'directly uses']):
+                # Try to extract a clean title from the mess
+                lines = page_title.split('.')
+                for line in lines:
+                    clean_line = re.sub(r'^\d+\.\s*', '', line.strip())
+                    clean_line = re.sub(r'^[a-zA-Z]+:\s*', '', clean_line).strip()
+                    if clean_line and len(clean_line) < 80 and not any(word in clean_line.lower() for word in ['here are', 'options', 'why:', 'directly']):
+                        page_title = clean_line
+                        break
+        
         if not page_title or page_title.strip().lower() == "none":
             page_title = commit_title or 'Code Commit Summary'
+        
+        # Add branch name if present (PD-number or NT)
+        if branch_name and (branch_name.startswith("PD-") or branch_name.startswith("NT")):
+            page_title = f"{branch_name}: {page_title}"
         # 3. Create the Code Commit page (in UP space, under Code Commits folder)
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
         folder_id = parent_folder_id or os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
@@ -1278,10 +1450,23 @@ class Theo():
         commit_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
         if not commit_content or commit_content == "None":
             commit_content = f"Code Commit Summary:\n\n{summary_str}"
-        # 2. Generate a concise page title
+        # 2. Extract branch name from push_info
+        branch_name = ""
+        if push_info and "ref" in push_info:
+            ref = push_info["ref"]
+            if ref.startswith("refs/heads/"):
+                branch_name = ref.replace("refs/heads/", "")
+        
+        # 3. Generate a concise page title
         title_prompt = (
-            "Given the following code commit content, generate a concise, descriptive Confluence page title.\n\n"
-            f"Content:\n{commit_content}\n"
+            "Generate a single, concise Confluence page title for this code push. "
+            "Return ONLY the title, no explanations, no options, no numbering.\n\n"
+            f"Push summary:\n{commit_content}\n\n"
+            "Examples of good titles:\n"
+            "- Fix user authentication bug in login module\n"
+            "- Add Redis caching to product API\n" 
+            "- Update database schema for orders table\n\n"
+            "Title:"
         )
         response = litellm.completion(
             model=model,
@@ -1293,8 +1478,35 @@ class Theo():
         page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
         if page_title:
             page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+            # Remove "Title:" prefix if present
+            page_title = re.sub(r'^Title:\s*', '', page_title, flags=re.IGNORECASE).strip()
+            # Remove explanatory LLM response patterns
+            page_title = re.sub(r'^Here are.*?options.*?:', '', page_title, flags=re.IGNORECASE | re.DOTALL).strip()
+            page_title = re.sub(r'^\d+\.\s*', '', page_title).strip()  # Remove numbering like "1. "
+            page_title = re.sub(r'^[a-zA-Z]+:\s*', '', page_title).strip()  # Remove "Why:" etc.
+            # Remove markdown formatting from title
+            page_title = re.sub(r'\*\*([^*]+)\*\*', r'\1', page_title)  # Remove **bold**
+            page_title = re.sub(r'\*([^*]+)\*', r'\1', page_title)      # Remove *italic*
+            page_title = re.sub(r'`([^`]+)`', r'\1', page_title)        # Remove `code`
+            # Take only the first line if multi-line
+            page_title = page_title.split('\n')[0].strip()
+            # If still contains explanatory text, extract the actual title
+            if len(page_title) > 100 or any(word in page_title.lower() for word in ['here are', 'options', 'why:', 'directly uses']):
+                # Try to extract a clean title from the mess
+                lines = page_title.split('.')
+                for line in lines:
+                    clean_line = re.sub(r'^\d+\.\s*', '', line.strip())
+                    clean_line = re.sub(r'^[a-zA-Z]+:\s*', '', clean_line).strip()
+                    if clean_line and len(clean_line) < 80 and not any(word in clean_line.lower() for word in ['here are', 'options', 'why:', 'directly']):
+                        page_title = clean_line
+                        break
+        
         if not page_title or page_title.strip().lower() == "none":
             page_title = "Code Commit Summary"
+        
+        # 4. Add branch name if present (PD-number or NT)
+        if branch_name and (branch_name.startswith("PD-") or branch_name.startswith("NT")):
+            page_title = f"{branch_name}: {page_title}"
         # 3. Create the Code Commit page (in UP space, under Code Commits folder)
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
         folder_id = parent_folder_id or os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
@@ -1352,13 +1564,25 @@ class Theo():
         if not adr_content or adr_content == "None":
             adr_content = f"ADR based on conversation:\n\n{context_summary or timeline_str}"
         
+        # Validate content completion and strip EOF marker
+        if "~EOF~" in adr_content:
+            adr_content = adr_content.replace("~EOF~", "").strip()
+            print(f"[DEBUG] ADR content completed successfully (EOF marker found)")
+        else:
+            print(f"[WARNING] ADR content may be truncated (no EOF marker found)")
+            adr_content += "\n\n*Note: This ADR may be incomplete due to generation limits.*"
+        
         # Post-process: Convert any Markdown table to a bullet list
         adr_content = self._markdown_table_to_bullet_list(adr_content)
         
-        # Generate a concise ADR page title
+        # Generate a concise ADR page title (short sentence)
         title_prompt = (
-            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
-            f"Content:\n{adr_content}\n"
+            "Given the following ADR content, generate a very concise, descriptive title (maximum 6-8 words, no more than a short sentence).\n\n"
+            f"Content:\n{adr_content}\n\n"
+            "Examples of good titles:\n"
+            "- Use Redis for session caching\n"
+            "- Migrate to microservices architecture\n"
+            "- Adopt React for frontend development\n"
         )
         response = litellm.completion(
             model=model,
@@ -1370,8 +1594,17 @@ class Theo():
         page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
         if page_title:
             page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+            # Remove "Title:" prefix if present
+            page_title = re.sub(r'^Title:\s*', '', page_title, flags=re.IGNORECASE).strip()
+            # Remove markdown formatting from title
+            page_title = re.sub(r'\*\*([^*]+)\*\*', r'\1', page_title)  # Remove **bold**
+            page_title = re.sub(r'\*([^*]+)\*', r'\1', page_title)      # Remove *italic*
+            page_title = re.sub(r'`([^`]+)`', r'\1', page_title)        # Remove `code`
+            # Ensure title is not too long
+            if len(page_title) > 60:
+                page_title = page_title[:57] + "..."
         if not page_title or page_title.strip().lower() == "none":
-            page_title = question or 'New ADR'
+            page_title = question[:57] + "..." if question and len(question) > 60 else (question or 'New ADR')
         
         # Create the ADR subpage (in UP space, parented under ADR parent page)
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
@@ -1388,17 +1621,43 @@ class Theo():
         new_page_id = confluence_response.get("id")
         new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id and base_url else ""
         
+        # Extract unique authors from thread history
+        authors = set()
+        bot_user_id = os.getenv("SLACK_BOT_USER_ID")
+        
+        if thread_history:
+            for msg in thread_history:
+                user_id = msg.get("user")
+                if user_id and not msg.get("bot_id") and user_id != bot_user_id:  # Exclude bot messages and bot user
+                    # Try to get display name, fallback to @user_id
+                    from theo.tools.slack import get_slack_user_info
+                    display_name = get_slack_user_info(user_id)
+                    if display_name and display_name != user_id:
+                        authors.add(f"@{display_name}")
+                    else:
+                        authors.add(f"@{user_id}")
+        
+        # Format authors list
+        authors_list = list(authors)
+        if len(authors_list) == 0:
+            authors_cell = "Unknown"
+        elif len(authors_list) == 1:
+            authors_cell = authors_list[0]
+        elif len(authors_list) == 2:
+            authors_cell = f"{authors_list[0]}, {authors_list[1]}"
+        else:
+            authors_cell = f"{authors_list[0]}, {authors_list[1]} +{len(authors_list)-2}"
+        
         # Add a new row to the ADR Index table
         # Columns: Title (link), Status, Date, Authors, Source
         date_str = datetime.utcnow().strftime("%Y-%m-%d")
         title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
-        status_cell = '📝 Proposed'
-        authors_cell = 'Technical Writer'
-        source_cell = 'Conversation'
+        status_cell = 'Proposed'
+        source_cell = '🤖 LLM (theo)'
         new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
         add_row_to_adr_index(adr_parent_page_id, new_row)
         
-        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
+        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title, "authors_info": authors_cell}
 
     def _is_schema_change(self, diff_text):
         """
@@ -1474,3 +1733,36 @@ def format_description(description_dict):
     for section, content in description_dict.items():
         lines.append(f"### {section}\n{content}\n")
     return "\n".join(lines)
+
+def validate_agent_response(agent_type, response, expected_action):
+    """
+    Final safety check to ensure agents only perform their assigned tasks.
+    """
+    if not response or not isinstance(response, str):
+        return True  # Let other validation handle this
+    
+    response_lower = response.lower()
+    
+    # Define what each agent should NOT do
+    forbidden_actions = {
+        "support_engineer": {
+            "patterns": ["created ticket", "jira ticket", "confluence page", "documentation created"],
+            "message": "Support Engineer attempted to create tickets or documentation"
+        },
+        "product_manager": {
+            "patterns": ["adr created", "documentation updated", "confluence page"],
+            "message": "Product Manager attempted to create ADRs or documentation"
+        },
+        "technical_writer": {
+            "patterns": ["jira ticket", "created ticket"] if expected_action not in ["documentation_and_adr"] else [],
+            "message": "Technical Writer attempted to create tickets outside of expected scope"
+        }
+    }
+    
+    if agent_type in forbidden_actions:
+        patterns = forbidden_actions[agent_type]["patterns"]
+        if any(pattern in response_lower for pattern in patterns):
+            print(f"[ERROR] {forbidden_actions[agent_type]['message']}: {response[:100]}...")
+            return False
+    
+    return True

@@ -71,7 +71,7 @@ def route_event_to_crew(event_type: str, payload: dict, parent_span=None, thread
         print(f"[DEBUG] Asking Supervisor agent to route message: {user_message}")
         supervisor_result = theo.supervisor_routing(question=user_message, conversation_id=conversation_id, thread_history=thread_history)
         print(f"[DEBUG] Supervisor agent LLM output: {supervisor_result}")
-        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
+        valid_tasks = {"support_request", "documentation_update", "adr_creation", "documentation_and_adr", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
         # Handle supervisor health/heartbeat direct response
         if isinstance(supervisor_result, tuple) and supervisor_result[0] in ("supervisor_health", "platform_health"):
             return {"result": supervisor_result[1], "task": supervisor_result[0], "conversation_id": conversation_id}

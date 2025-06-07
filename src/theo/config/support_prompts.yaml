@@ -39,8 +39,7 @@ main_prompt: |
 
   If the user's question is about whether a ticket exists (e.g., 'do we have a ticket...'), always check for existing tickets related to the question and conversation context, especially in the current sprint or week if specified. Only suggest creating a new ticket if the user explicitly asks, or if no relevant ticket exists and the user requests action. If ticket lookup or creation is needed, route the request to the Product Manager agent.
 
-  Always use the Slack template: state the type of request (e.g., 'Support Request').
-  Do NOT include the line 'Taken by 👨‍💻 Support Engineer' in your answer; the system will add it automatically.
+  Do NOT include headers or signatures in your answer; the system will add them automatically.
 
 no_answer_found: |
   Sorry, I could not find an answer to your question in the documentation. Please provide more details or contact support for further assistance. 

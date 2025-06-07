@@ -2,7 +2,11 @@
 
 set -e
 
-# Build and start Docker Compose services in detached mode
+# Stop any existing services first
+echo "🛑 Stopping any existing Theo services..."
+docker compose -f docker-compose.dev.yml down
+
+# Build and start Docker Compose services
 echo "🚀 Building and starting Theo services with Docker Compose..."
 docker compose -f docker-compose.dev.yml up --build
 

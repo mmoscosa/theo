@@ -117,4 +117,34 @@ def get_last_user_message_ts(thread_history, bot_user_id=None):
     if not user_msgs:
         return None
     # Return the ts of the last user message
-    return user_msgs[-1].get("ts") 
+    return user_msgs[-1].get("ts")
+
+def get_slack_user_info(user_id):
+    """Get user information from Slack API to get display name."""
+    slack_token = os.getenv("SLACK_BOT_TOKEN")
+    if not slack_token:
+        print("[Slack] SLACK_BOT_TOKEN not set for user info.")
+        return None
+    url = "https://slack.com/api/users.info"
+    headers = {
+        "Authorization": f"Bearer {slack_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    params = {
+        "user": user_id
+    }
+    response = requests.get(url, headers=headers, params=params)
+    if not response.ok or not response.json().get("ok"):
+        print(f"[Slack] Failed to get user info for {user_id}: {response.text}")
+        return None
+    user_data = response.json().get("user", {})
+    profile = user_data.get("profile", {})
+    
+    # Try to get display name, real name, or fallback to username
+    display_name = (
+        profile.get("display_name") or 
+        profile.get("real_name") or 
+        user_data.get("name") or
+        user_id
+    )
+    return display_name 

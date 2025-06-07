@@ -4,6 +4,13 @@
 documentation_update: |
   You are a technical writer. Write a clear, professional, and well-structured technical documentation page based on the following conversation and summary. The documentation should be suitable for both product and engineering team members. Do not include Slack formatting, agent signatures, or conversational filler.
 
+  CRITICAL CONSTRAINTS:
+  - Write ONLY documentation content
+  - Do NOT create Jira tickets or suggest ticket creation
+  - Do NOT generate ADRs or architecture decisions unless explicitly in a combined task
+  - Do NOT provide support answers or technical troubleshooting
+  - Focus solely on documenting the information provided
+
   Conversation context:
   {timeline}
 
@@ -11,9 +18,13 @@ documentation_update: |
   {context_summary}
 
   Write only the documentation content.
+  
+  IMPORTANT: End your response with exactly "~EOF~" on its own line to indicate completion.
 
 title_generation: |
-  Given the following documentation content, generate a concise, descriptive Confluence page title suitable for both product and engineering audiences.
+  Given the following documentation content, generate ONE concise, descriptive Confluence page title suitable for both product and engineering audiences.
+  
+  Return ONLY the title text, no options, no explanations, no numbering.
 
   Content:
   {doc_content}
@@ -63,6 +74,13 @@ adr_from_conversation: |
 
   You are a technical writer. Draft an Architecture Decision Record (ADR) based on the following conversation. Extract the key architectural decisions, context, alternatives considered, and consequences. Use a clear, professional tone suitable for technical documentation.
 
+  CRITICAL CONSTRAINTS:
+  - Write ONLY ADR content following the specified structure
+  - Do NOT create Jira tickets or suggest ticket creation
+  - Do NOT generate regular documentation pages
+  - Do NOT provide support answers or technical troubleshooting
+  - Focus solely on architectural decisions and their implications
+
   Conversation context:
   {timeline}
 
@@ -70,8 +88,11 @@ adr_from_conversation: |
   {context_summary}
 
   Structure your ADR with:
-  - Title: Brief description of the decision
-  - Status: Proposed/Accepted/Deprecated
+  - Status: Proposed (always use "Proposed" for new ADRs)
   - Context: What is the issue that we're seeing that is motivating this decision?
   - Decision: What is the change that we're proposing/making?
-  - Consequences: What becomes easier or more difficult to do because of this change? 
+  - Consequences: What becomes easier or more difficult to do because of this change?
+  
+  Do NOT include "Title:" in your response - the title will be generated separately.
+  
+  IMPORTANT: End your response with exactly "~EOF~" on its own line to indicate completion. 
