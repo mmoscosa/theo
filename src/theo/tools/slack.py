@@ -28,7 +28,7 @@ def add_slack_reaction(channel, timestamp, emoji):
     slack_token = os.getenv("SLACK_BOT_TOKEN")
     if not slack_token:
         print("[Slack] SLACK_BOT_TOKEN not set for reactions.")
-        return
+        return False
     url = "https://slack.com/api/reactions.add"
     headers = {
         "Authorization": f"Bearer {slack_token}",
@@ -40,16 +40,22 @@ def add_slack_reaction(channel, timestamp, emoji):
         "name": emoji
     }
     response = requests.post(url, headers=headers, json=data)
-    if not response.ok or not response.json().get("ok"):
-        print(f"[Slack] Failed to add reaction: {response.text}")
+    response_data = response.json() if response.ok else {}
+    
+    if not response.ok or not response_data.get("ok"):
+        error = response_data.get("error", "unknown_error")
+        if error != "already_reacted":  # Don't log already_reacted as an error
+            print(f"[Slack] Failed to add reaction: {response.text}")
+        return False
     else:
         print(f"[Slack] Reaction :{emoji}: added successfully.")
+        return True
 
 def remove_slack_reaction(channel, timestamp, emoji):
     slack_token = os.getenv("SLACK_BOT_TOKEN")
     if not slack_token:
         print("[Slack] SLACK_BOT_TOKEN not set for reactions.")
-        return
+        return False
     url = "https://slack.com/api/reactions.remove"
     headers = {
         "Authorization": f"Bearer {slack_token}",
@@ -61,10 +67,16 @@ def remove_slack_reaction(channel, timestamp, emoji):
         "name": emoji
     }
     response = requests.post(url, headers=headers, json=data)
-    if not response.ok or not response.json().get("ok"):
-        print(f"[Slack] Failed to remove reaction: {response.text}")
+    response_data = response.json() if response.ok else {}
+    
+    if not response.ok or not response_data.get("ok"):
+        error = response_data.get("error", "unknown_error")
+        if error not in ["no_reaction", "not_authed"]:  # Don't log these as errors
+            print(f"[Slack] Failed to remove reaction: {response.text}")
+        return False
     else:
         print(f"[Slack] Reaction :{emoji}: removed successfully.")
+        return True
 
 def format_slack_response(
     category_emoji, category_title,

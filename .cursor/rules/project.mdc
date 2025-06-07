@@ -6,6 +6,7 @@ alwaysApply: true
 # Theo / Cursor Agent System Rules & Context
 
 IMPORTANT: Because we use CrewAi then LiteLLM is required, all LLM implementations should be through LiteLLM
+Any Test you create always put it under tests/ folder
 
 ---
 

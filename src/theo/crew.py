@@ -303,7 +303,9 @@ class Theo():
                 text = msg.get("text", "").strip()
                 ts = msg.get("ts", "")
                 if text:
-                    timeline.append(f"[{ts}] {user}: {text}")
+                    # Filter out agent signatures to prevent LLM from copying them
+                    if "_Taken by" not in text:
+                        timeline.append(f"[{ts}] {user}: {text}")
         timeline_str = "\n".join(timeline) if timeline else "No timeline available."
         doc_prompt = self.technical_writer_prompts["documentation_update"] \
             .replace("{timeline}", timeline_str) \
@@ -643,6 +645,7 @@ class Theo():
         from datetime import datetime
         import pytz
         bedrock = BedrockClient()
+        print(f"[DEBUG] Bedrock KB IDs: code_doc={bedrock.code_doc_kb}, db_schema={bedrock.db_schema_kb}, general={bedrock.general_kb}")
         agent_role = self.agents_config['support_engineer']['role']
         agent_emoji = "👨‍💻"
         category_emoji = "📄"
@@ -650,13 +653,81 @@ class Theo():
         model = self.support_engineer_model
         model_provider = get_model_provider("AGENT_SUPPORT_ENGINEER_MODEL", "AGENT_SUPPORT_ENGINEER_PROVIDER")
         context_summary_clean = "" if context_summary in (None, "None") else context_summary
-        docs = bedrock.search_code_documentation(question)
-        print(f"[DEBUG] Bedrock docs: {docs}")
-        # Get current date/time in Central Time
+        
+        # Get current date/time in Central Time first
         tz = pytz.timezone("America/Chicago")
         now = datetime.now(tz)
         current_date = now.strftime("%Y-%m-%d")
         current_time = now.strftime("%H:%M %Z")
+        
+        # Enhance search query with time context detection
+        enhanced_question = self._enhance_question_with_time_context(question, current_date)
+        print(f"[DEBUG] Original question: {question}")
+        print(f"[DEBUG] Enhanced question: {enhanced_question}")
+        
+        try:
+            docs_result = bedrock.search_code_documentation(enhanced_question)
+            print(f"[DEBUG] Bedrock docs result type: {type(docs_result)}")
+            print(f"[DEBUG] Bedrock docs result: {docs_result}")
+            
+            # Fallback: if enhanced search doesn't find recent info, try basic search
+            if isinstance(docs_result, dict):
+                sources = docs_result.get("sources", [])
+                # Check if we have any sources from the current month
+                current_month = current_date[:7]  # "2025-06"
+                has_recent_sources = any(current_month in str(source) for source in sources if source)
+                
+                if not has_recent_sources:
+                    print(f"[DEBUG] Enhanced search didn't find recent sources, trying basic search...")
+                    fallback_result = bedrock.search_code_documentation(question)
+                    print(f"[DEBUG] Fallback search result: {fallback_result}")
+                    
+                    # Use fallback if it has more recent sources
+                    if isinstance(fallback_result, dict):
+                        fallback_sources = fallback_result.get("sources", [])
+                        fallback_has_recent = any(current_month in str(source) for source in fallback_sources if source)
+                        if fallback_has_recent:
+                            print(f"[DEBUG] Using fallback search results as they contain more recent information")
+                            docs_result = fallback_result
+        except Exception as e:
+            print(f"[ERROR] Bedrock search_code_documentation failed: {e}")
+            docs_result = f"[ERROR] Bedrock search failed: {str(e)}"
+        
+        # Handle both old string format and new dict format for backward compatibility
+        if isinstance(docs_result, dict):
+            docs = docs_result.get("content", "")
+            sources = docs_result.get("sources", [])
+            print(f"[DEBUG] Extracted sources from dict: {sources}")
+            print(f"[DEBUG] Sources type: {type(sources)}, length: {len(sources) if sources else 0}")
+            
+            # Extract and sort dates from sources to help LLM understand chronology
+            source_dates = []
+            for source in sources:
+                if source and "Stand-Up+Notes+" in source:
+                    # Extract date from URL like "Daily+Stand-Up+Notes+6+3+25"
+                    import re
+                    date_match = re.search(r'Stand-Up\+Notes\+(\d+)\+(\d+)\+(\d+)', source)
+                    if date_match:
+                        month, day, year = date_match.groups()
+                        # Convert to full year format for comparison
+                        full_year = f"20{year}" if len(year) == 2 else year
+                        date_str = f"{full_year}-{month.zfill(2)}-{day.zfill(2)}"
+                        source_dates.append(date_str)
+            
+            if source_dates:
+                source_dates.sort(reverse=True)  # Most recent first
+                most_recent_date = source_dates[0]
+                print(f"[DEBUG] Source dates found: {source_dates}, most recent: {most_recent_date}")
+                
+                # Add prominent chronological context to docs content
+                docs = f"🗓️ **CHRONOLOGICAL CONTEXT - READ THIS FIRST:**\n" \
+                       f"Sources available: {', '.join(source_dates)}\n" \
+                       f"MOST RECENT DATE: {most_recent_date}\n" \
+                       f"USE INFORMATION FROM {most_recent_date} FIRST!\n\n{docs}"
+        else:
+            docs = docs_result
+            sources = []
+            print(f"[DEBUG] Docs result is string format, no sources available")
         # Use YAML prompt for support
         llm_prompt = self.support_prompts["main_prompt"] \
             .replace("{question}", question or "") \
@@ -689,6 +760,37 @@ class Theo():
             )
             print(f"[DEBUG] LLM raw output: {main_content}")
             main_content = markdown_to_slack(main_content)
+            
+            # Add source citations if available
+            if sources and any(source for source in sources if source):
+                valid_sources = [source for source in sources if source and source != "[No content in results]"]
+                print(f"[DEBUG] Valid sources found: {valid_sources}")
+                if valid_sources:
+                    source_links = []
+                    for i, source in enumerate(valid_sources, 1):
+                        print(f"[DEBUG] Processing source {i}: {source}")
+                        if source and source.startswith("http"):
+                            # Keep sources as simple numbered brackets: [1] [2] [3]
+                            source_links.append(f"<{source}|[{i}]>")
+                            print(f"[DEBUG] Added HTTP link: <{source}|[{i}]>")
+                        else:
+                            # It's an S3 URI or other reference
+                            source_links.append(f"[{i}]")
+                            print(f"[DEBUG] Added non-HTTP reference: [{i}] for source: {source}")
+                    
+                    if source_links:
+                        # Replace the LLM's "Sources: [1]" pattern with our clickable version
+                        import re
+                        # Find and replace the existing Sources line if it exists
+                        sources_pattern = r'Sources:\s*(\[[0-9,\s\[\]]+\]|\[[0-9]+\](?:\s*\[[0-9]+\])*)'
+                        if re.search(sources_pattern, main_content):
+                            main_content = re.sub(sources_pattern, f"Sources: {' '.join(source_links)}", main_content)
+                            print(f"[DEBUG] Replaced existing sources line with: Sources: {' '.join(source_links)}")
+                        else:
+                            main_content += f"\n\nSources: {' '.join(source_links)}"
+                            print(f"[DEBUG] Added new sources line: Sources: {' '.join(source_links)}")
+            else:
+                print(f"[DEBUG] No valid sources to display")
         except Exception as e:
             print(f"[ERROR] LLM call failed: {e}")
             main_content = self.support_prompts["no_answer_found"]
@@ -699,6 +801,104 @@ class Theo():
             agent_role=agent_role,
             agent_emoji=agent_emoji
         )
+
+    def _extract_readable_title_from_url(self, url):
+        """
+        Extract a human-readable title from a Confluence URL.
+        
+        Examples:
+        - 'Daily+Stand-Up+Notes+5+27+25' -> 'Stand-up 5/27/25'
+        - 'System+Refactor+Initiative' -> 'System Refactor Initiative'
+        """
+        import re
+        from urllib.parse import unquote
+        
+        try:
+            # Extract the page title from URL (after last slash, before any query params)
+            if '/pages/' in url:
+                # Extract page title part: /pages/123456789/Page+Title+Here
+                page_part = url.split('/pages/')[-1]
+                if '/' in page_part:
+                    title_part = page_part.split('/', 1)[1]  # Get part after page ID
+                else:
+                    title_part = page_part
+                
+                # Remove query parameters
+                if '?' in title_part:
+                    title_part = title_part.split('?')[0]
+                
+                # URL decode and clean up
+                title = unquote(title_part.replace('+', ' '))
+                
+                # Special handling for standup notes
+                standup_match = re.search(r'Daily Stand-Up Notes (\d+) (\d+) (\d+)', title, re.IGNORECASE)
+                if standup_match:
+                    month, day, year = standup_match.groups()
+                    return f"Stand-up {month}/{day}/{year}"
+                
+                # General cleanup - limit length and clean up
+                title = re.sub(r'\s+', ' ', title).strip()
+                if len(title) > 35:
+                    title = title[:32] + "..."
+                
+                return title if title else "Document"
+        except Exception:
+            pass
+        
+        # Fallback to domain name or generic title
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(url).netloc
+            if 'atlassian.net' in domain:
+                return "Confluence Doc"
+            return domain
+        except Exception:
+            return "Document"
+
+    def _enhance_question_with_time_context(self, question, current_date):
+        """
+        Enhance the search question with time context for better Bedrock results.
+        
+        For current time references (this week, today, recently), add current date context.
+        For specific time references (week of May 27th), keep the specific timeframe.
+        """
+        if not question:
+            return question
+            
+        question_lower = question.lower()
+        
+        # Current time references - add current date context
+        current_time_keywords = [
+            "this week", "today", "recently", "current", "now", "currently", 
+            "latest", "new", "recent", "this sprint", "this month"
+        ]
+        
+        if any(keyword in question_lower for keyword in current_time_keywords):
+            # Add current date context but make search more inclusive
+            enhanced = f"{question} standup notes recent updates current date {current_date}"
+            return enhanced
+        
+        # Specific time references - extract and use the specific timeframe
+        import re
+        
+        # Look for specific dates, weeks, months
+        date_patterns = [
+            r"week of (\w+ \d+)",  # "week of May 27"
+            r"(\w+ \d+)",          # "May 27"
+            r"last (\w+)",         # "last week", "last month"
+            r"(\w+day)",           # "Monday", "Tuesday", etc.
+        ]
+        
+        for pattern in date_patterns:
+            matches = re.findall(pattern, question_lower)
+            if matches:
+                # Include the specific timeframe in the search
+                timeframe = matches[0]
+                enhanced = f"{question} {timeframe} standup notes"
+                return enhanced
+        
+        # Default: return original question
+        return question
 
     def _is_heartbeat_question(self, question):
         import litellm
@@ -852,7 +1052,9 @@ class Theo():
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
-                        timeline.append(f"[{ts}] {user}: {text}")
+                        # Filter out agent signatures to prevent LLM from copying them
+                        if "_Taken by" not in text:
+                            timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
             # Use YAML task description for documentation update
             base_prompt = self.supervisor_prompts["routing_prompt"]
@@ -920,7 +1122,9 @@ class Theo():
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
-                        timeline.append(f"[{ts}] {user}: {text}")
+                        # Filter out agent signatures to prevent LLM from copying them
+                        if "_Taken by" not in text:
+                            timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
             table_names = extract_table_names(question)
             print(f"[DEBUG] Extracted table names: {table_names}")
@@ -1049,7 +1253,9 @@ class Theo():
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
-                        timeline.append(f"[{ts}] {user}: {text}")
+                        # Filter out agent signatures to prevent LLM from copying them
+                        if "_Taken by" not in text:
+                            timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline)
             
             logging.info(f"Timeline sent to LLM for ticket creation:\n{timeline_str}")
@@ -1721,6 +1927,43 @@ def markdown_to_slack(text):
     # Convert __italic__ or _italic_ to _italic_
     text = re.sub(r'__(.*?)__', r'_\1_', text)
     text = re.sub(r'_(.*?)_', r'_\1_', text)
+    
+    # Clean up any raw Confluence URLs that appear in message content (not sources)
+    # Look for patterns like: https://sunroom.atlassian.net/wiki/spaces/UP/pages/123456/Some+Page+Title
+    def clean_confluence_url(match):
+        url = match.group(0)
+        # Only clean if it's not already in <url|text> format
+        if '<' in url or '|' in url:
+            return url
+        
+        # Extract readable title
+        from urllib.parse import unquote
+        try:
+            if '/pages/' in url:
+                page_part = url.split('/pages/')[-1]
+                if '/' in page_part:
+                    title_part = page_part.split('/', 1)[1]
+                    title = unquote(title_part.replace('+', ' '))
+                    
+                    # Special handling for standup notes
+                    standup_match = re.search(r'Daily Stand-Up Notes (\d+) (\d+) (\d+)', title, re.IGNORECASE)
+                    if standup_match:
+                        month, day, year = standup_match.groups()
+                        title = f"Stand-up {month}/{day}/{year}"
+                    
+                    # Limit length
+                    if len(title) > 35:
+                        title = title[:32] + "..."
+                    
+                    return f"<{url}|{title}>"
+        except Exception:
+            pass
+        
+        return url
+    
+    # Apply URL cleaning to any Confluence URLs in the message content
+    text = re.sub(r'https://[^>\s]+\.atlassian\.net/wiki/[^>\s]+', clean_confluence_url, text)
+    
     return text
 
 def format_description(description_dict):

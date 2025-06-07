@@ -2,11 +2,11 @@
 # Use {placeholders} for variables to be filled in at runtime.
 
 routing_actions:
-  support_request: "Support Engineer: for support, help, troubleshooting, technical questions, or 'how to' questions (e.g., 'how do I...', 'how does...', 'how can we...')"
+  support_request: "Support Engineer: for support, help, troubleshooting, technical questions, information lookups, standup notes, documentation questions, or 'how to' questions (e.g., 'how do I...', 'how does...', 'how can we...', 'what did the team work on', 'standup notes', 'what is X doing')"
   documentation_update: "Technical Writer: for documentation requests or when user wants to remember/store information (e.g., 'document this', 'create docs', 'update documentation', 'remember this', 'remember that', 'store this')"
   adr_creation: "Technical Writer: for ADR creation (when user mentions 'ADR', 'adr', 'create ADR', 'new ADR', 'build an ADR', 'architecture decision record', or wants to create any architectural decision document)"
   documentation_and_adr: "Technical Writer: when user explicitly requests BOTH documentation AND ADR creation (e.g., 'create a document and adr', 'document this and create an adr', 'both docs and adr')"
-  bi_report: "BI Engineer: for reports, analytics, SQL, or data questions"
+  bi_report: "BI Engineer: for business metrics, database analytics, SQL queries, revenue reports, or performance data (e.g., 'SQL query', 'revenue this month', 'partner metrics', 'database report')"
   ticket_creation: "Product Manager: for tickets, issues, or feature requests"
   platform_health: "Supervisor: for platform health, heartbeat, or status checks (e.g., 'you up?', 'are you there?', 'is the system online?')"
   clarification_needed: "If you are unsure or the request is ambiguous, respond with: clarification_needed"
@@ -41,10 +41,19 @@ routing_prompt: |
   - Contains "make ticket" → respond "ticket_creation"
   - Contains "jira ticket" → respond "ticket_creation"
 
-  **STEP 4: If no specific keywords, then check other routing:**
+  **STEP 4: CHECK FOR STANDUP/DOCUMENTATION LOOKUPS (NO OTHER ACTIONS)**
+  If user is asking for information from standup notes, documentation, or team activities:
+  - Contains "standup" → respond "support_request"
+  - Contains "what did [person] do" → respond "support_request"
+  - Contains "what did the team work" → respond "support_request"
+  - Contains "what is [person] doing" → respond "support_request"
+  - Contains "based on standup notes" → respond "support_request"
+  - Contains "team activities" → respond "support_request"
+
+  **STEP 5: If no specific keywords, then check other routing:**
   - support_request: for help, how-to questions, asking for suggestions/recommendations, technical support (e.g., "what do you suggest?", "how should we...", "what's the best way...")
   - documentation_update: when asking to document/remember/store information (e.g., "document this", "remember this", "store this")
-  - bi_report: for data, analytics, reports, SQL questions
+  - bi_report: for business metrics, database analytics, SQL queries, revenue/performance data (NOT for standup notes or team activities)
   - ticket_creation: ONLY when explicitly asking to "create ticket", "new ticket", "make a ticket"
   - platform_health: for system status checks
 
@@ -58,6 +67,10 @@ routing_prompt: |
   "what's the best approach for..." → support_request (asking for recommendations)
   "create a ticket for this" → ticket_creation (explicitly asking for ticket)
   "new jira ticket needed" → ticket_creation (explicitly asking for ticket)
+  "what did the team work on this week?" → support_request (standup/team activity lookup)
+  "based on standup notes, what is rostam doing?" → support_request (standup lookup)
+  "what is david working on?" → support_request (team member activity lookup)
+  "show me revenue from last month" → bi_report (database/business metrics)
 
   **NEGATIVE Examples (DO NOT respond with these - use clarification_needed instead):**
   "create adr and ticket" → clarification_needed (ambiguous, multiple actions)
