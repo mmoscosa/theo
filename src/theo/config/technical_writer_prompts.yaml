@@ -53,4 +53,25 @@ db_schema_changes: |
   Push info: {commit_info}
 
   Model changes:
-  {summary_str} 
+  {summary_str}
+
+adr_from_conversation: |
+  IMPORTANT: Do NOT use tables. Use only a bullet list for the summary. If you use a table, your answer will be discarded.
+  For the summary section, use this format (not a table):
+  - Decision: ... Consequence: ...
+  - ...
+
+  You are a technical writer. Draft an Architecture Decision Record (ADR) based on the following conversation. Extract the key architectural decisions, context, alternatives considered, and consequences. Use a clear, professional tone suitable for technical documentation.
+
+  Conversation context:
+  {timeline}
+
+  Summary:
+  {context_summary}
+
+  Structure your ADR with:
+  - Title: Brief description of the decision
+  - Status: Proposed/Accepted/Deprecated
+  - Context: What is the issue that we're seeing that is motivating this decision?
+  - Decision: What is the change that we're proposing/making?
+  - Consequences: What becomes easier or more difficult to do because of this change? 

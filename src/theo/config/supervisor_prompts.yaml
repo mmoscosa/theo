@@ -4,6 +4,7 @@
 routing_actions:
   support_request: "Support Engineer: for support, help, troubleshooting, or technical questions"
   documentation_update: "Technical Writer: for documentation requests or updates"
+  adr_creation: "Technical Writer: for ADR creation (only when user explicitly requests 'create ADR', 'new ADR', or 'architecture decision record')"
   bi_report: "BI Engineer: for reports, analytics, SQL, or data questions"
   ticket_creation: "Product Manager: for tickets, issues, or feature requests"
   platform_health: "Supervisor: for platform health, heartbeat, or status checks (e.g., 'you up?', 'are you there?', 'is the system online?')"
@@ -17,9 +18,11 @@ routing_prompt: |
   Conversation context (summarized thread):
   {context_summary}
 
-  IMPORTANT: If the user asks about tickets, sprints, the board, or anything related to Jira, ticket status, or planning (e.g., 'do we have a ticket', 'is there a ticket', 'what's in the sprint', 'what's on the board'), always route to the Product Manager (ticket_creation). The Product Manager is the expert for these topics.
+  IMPORTANT: 
+  - If the user explicitly asks to "create ADR", "new ADR", or mentions "architecture decision record", route to adr_creation.
+  - If the user asks about tickets, sprints, the board, or anything related to Jira, ticket status, or planning (e.g., 'do we have a ticket', 'is there a ticket', 'what's in the sprint', 'what's on the board'), always route to the Product Manager (ticket_creation). The Product Manager is the expert for these topics.
 
-  Respond ONLY with one of: support_request, documentation_update, bi_report, ticket_creation, platform_health, clarification_needed.
+  Respond ONLY with one of: support_request, documentation_update, adr_creation, bi_report, ticket_creation, platform_health, clarification_needed.
 
 summary_prompt: |
   You are an expert assistant summarizing a Slack thread for an AI agent router.

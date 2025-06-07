@@ -33,7 +33,7 @@ import litellm
 from theo.tools.jira import create_jira_ticket
 from theo.tools.slack import send_slack_message
 import logging
-from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages
+from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages, add_row_to_adr_index
 import html
 import requests
 from datetime import datetime
@@ -221,8 +221,8 @@ class Theo():
         # If supervisor_health, return the tuple directly
         if answer_clean in ("supervisor_health", "platform_health"):
             return result
-        # For bi_report and documentation_update, pass both summary and raw thread
-        if answer_clean == "bi_report" or answer_clean == "documentation_update":
+        # For bi_report, documentation_update, and adr_creation, pass both summary and raw thread
+        if answer_clean in ["bi_report", "documentation_update", "adr_creation"]:
             print(f"[DEBUG] Passing to downstream agent: answer={answer_clean}, context_summary={context_summary}, thread_history={thread_history}")
             return {
                 "task_name": answer_clean,
@@ -485,6 +485,39 @@ class Theo():
             "conversation_id": conversation_id
         })
         return answer
+
+    def adr_creation(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
+        print(f"[DEBUG] adr_creation called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}, kwargs={kwargs}")
+        datadog = DatadogClient()
+        
+        # Create ADR from conversation
+        adr_result = self.create_adr_from_conversation(
+            question=question,
+            conversation_id=conversation_id,
+            context_summary=context_summary,
+            thread_history=thread_history,
+            **kwargs
+        )
+        
+        # Format the response message
+        page_title = adr_result.get("adr_title", "New ADR")
+        page_url = adr_result.get("adr_page_url", "")
+        
+        slack_message = (
+            f":memo: **ADR Created**\n\n"
+            f"Architecture Decision Record <{page_url}|{page_title}> has been created and added to the [ADR Index](https://sunroom.atlassian.net/wiki/spaces/UP/pages/2117566465/Architecture+Decision+Record+ADR#%F0%9F%93%84-ADR-Index).\n\n"
+            f"_Taken by 📝 Technical Writer_"
+        )
+        
+        print(f"[DEBUG] adr_creation result: {slack_message}")
+        datadog.log_audit_event({
+            "event_type": "adr_creation",
+            "question": question,
+            "adr_title": page_title,
+            "adr_url": page_url,
+            "conversation_id": conversation_id
+        })
+        return slack_message
 
     def support_request(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
         print(f"[DEBUG] support_request called with question={question}, conversation_id={conversation_id}, kwargs={kwargs}")
@@ -1280,6 +1313,92 @@ class Theo():
         new_page_id = confluence_response.get("id")
         new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id and base_url else ""
         return {"commit_page_id": new_page_id, "commit_page_url": new_page_url, "commit_title": page_title}
+
+    def create_adr_from_conversation(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
+        """
+        Create a new ADR based on a conversation/request and add it to the ADR Index table.
+        """
+        import litellm
+        from theo.tools.confluence import create_confluence_page, add_row_to_adr_index
+        from datetime import datetime
+        import os, re
+        
+        model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
+        
+        # Build timeline from thread history
+        timeline = []
+        if thread_history:
+            for msg in thread_history:
+                user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                text = msg.get("text", "").strip()
+                ts = msg.get("ts", "")
+                if text:
+                    timeline.append(f"[{ts}] {user}: {text}")
+        timeline_str = "\n".join(timeline) if timeline else "No conversation history available."
+        
+        # Generate ADR content using LLM
+        adr_prompt = self.technical_writer_prompts["adr_from_conversation"] \
+            .replace("{timeline}", timeline_str) \
+            .replace("{context_summary}", context_summary or "")
+        
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": adr_prompt}
+            ]
+        )
+        adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not adr_content or adr_content == "None":
+            adr_content = f"ADR based on conversation:\n\n{context_summary or timeline_str}"
+        
+        # Post-process: Convert any Markdown table to a bullet list
+        adr_content = self._markdown_table_to_bullet_list(adr_content)
+        
+        # Generate a concise ADR page title
+        title_prompt = (
+            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
+            f"Content:\n{adr_content}\n"
+        )
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a technical writer."},
+                {"role": "user", "content": title_prompt}
+            ]
+        )
+        page_title = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if page_title:
+            page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
+        if not page_title or page_title.strip().lower() == "none":
+            page_title = question or 'New ADR'
+        
+        # Create the ADR subpage (in UP space, parented under ADR parent page)
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+        adr_parent_page_id = os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+        base_url = os.getenv("CONFLUENCE_BASE_URL")
+        
+        # Use the create_confluence_page function with parent_id support
+        confluence_response = create_confluence_page(
+            page_title, 
+            adr_content, 
+            space_key=space_key,
+            parent_id=adr_parent_page_id
+        )
+        new_page_id = confluence_response.get("id")
+        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id and base_url else ""
+        
+        # Add a new row to the ADR Index table
+        # Columns: Title (link), Status, Date, Authors, Source
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
+        status_cell = '📝 Proposed'
+        authors_cell = 'Technical Writer'
+        source_cell = 'Conversation'
+        new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
+        add_row_to_adr_index(adr_parent_page_id, new_row)
+        
+        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
 
     def _is_schema_change(self, diff_text):
         """
