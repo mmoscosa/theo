@@ -776,7 +776,9 @@ class Theo():
                     code = match.group(1)
                     # Only wrap if not already in a code block
                     if not code.strip().startswith('```'):
-                        return f'```json\n{code.strip()}\n```'
+                        return f'```
+{code.strip()}
+```'
                     return code
                 return json_pattern.sub(replacer, text)
             main_content = format_json_code_blocks(main_content)
