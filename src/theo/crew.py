@@ -33,7 +33,7 @@ import litellm
 from theo.tools.jira import create_jira_ticket
 from theo.tools.slack import send_slack_message
 import logging
-from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages, add_row_to_adr_index
+from theo.tools.confluence import update_confluence_page, create_confluence_page, get_all_confluence_pages
 import html
 import requests
 from datetime import datetime
@@ -364,8 +364,14 @@ class Theo():
         # Main doc update (UP) if prompted
         if not close_conversation:
             from theo.tools.confluence import create_confluence_page
-            print(f"[DEBUG] Creating/Updating main doc in UP space.")
-            confluence_response = create_confluence_page(page_title, doc_content, space_key=os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP"))
+            print(f"[DEBUG] Creating/Updating main doc in UP space under documentation folder.")
+            docs_folder_id = os.getenv("CONFLUENCE_DOCS_FOLDER_ID", "2141782055")
+            confluence_response = create_confluence_page(
+                page_title, 
+                doc_content, 
+                space_key=os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP"),
+                parent_id=docs_folder_id
+            )
             # Build Confluence URL
             page_id = confluence_response.get("id")
             base_url = os.getenv("CONFLUENCE_BASE_URL")
@@ -1087,24 +1093,19 @@ class Theo():
             return '\n'.join(new_lines)
         return md_text
 
-    def create_adr_from_github(self, commit_title, commit_body, commit_url, author, date, diff_url=None, parent_adr_page_id=None):
+    def create_code_commit_from_github(self, commit_title, commit_body, commit_url, author, date, diff_url=None, parent_folder_id=None):
         """
-        Create a new ADR subpage and update the ADR Index table in Confluence based on a GitHub merge to main.
+        Create a new Code Commit page in Confluence based on a GitHub merge to main.
         """
         import litellm
-        from theo.tools.confluence import create_confluence_page, add_row_to_adr_index
+        from theo.tools.confluence import create_confluence_page
         from datetime import datetime
-        # 1. Generate ADR content using LLM
+        # 1. Generate Code Commit content using LLM
         model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
-        adr_prompt = (
-            "IMPORTANT: Do NOT use tables. Use only a bullet list for the summary. If you use a table, your answer will be discarded.\n"
-            "For the summary section, use this format (not a table):\n"
-            "- Decision: Prevent duplicate activations. Consequence: Improved data integrity and sync process.\n"
-            "- Decision: Remove special characters. Consequence: Cleaner data with uniform sender names.\n"
-            "- ...\n"
-            "\nYou are a technical writer. Draft an Architecture Decision Record (ADR) for the following code change. "
-            "Summarize the context, decision, alternatives, and consequences. Use a clear, professional tone. "
-            "For the summary section, output a bullet list of decisions and consequences (not a table).\n\n"
+        commit_prompt = (
+            "You are a technical writer. Create a detailed summary of this code commit. "
+            "Document what changed, why it changed, and any important implementation details. Use a clear, professional tone. "
+            "Structure the content for easy reference by developers.\n\n"
             f"Commit title: {commit_title}\n"
             f"Commit body: {commit_body}\n"
             f"Commit URL: {commit_url}\n"
@@ -1116,18 +1117,16 @@ class Theo():
             model=model,
             messages=[
                 {"role": "system", "content": "You are a technical writer."},
-                {"role": "user", "content": adr_prompt}
+                {"role": "user", "content": commit_prompt}
             ]
         )
-        adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
-        if not adr_content or adr_content == "None":
-            adr_content = f"ADR for commit: {commit_title}\n\n{commit_body}"
-        # Post-process: Convert any Markdown table to a bullet list
-        adr_content = self._markdown_table_to_bullet_list(adr_content)
-        # 2. Generate a concise ADR page title
+        commit_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not commit_content or commit_content == "None":
+            commit_content = f"Code Commit Summary: {commit_title}\n\n{commit_body}"
+        # 2. Generate a concise page title
         title_prompt = (
-            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
-            f"Content:\n{adr_content}\n"
+            "Given the following code commit content, generate a concise, descriptive Confluence page title.\n\n"
+            f"Content:\n{commit_content}\n"
         )
         response = litellm.completion(
             model=model,
@@ -1140,44 +1139,21 @@ class Theo():
         if page_title:
             page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
         if not page_title or page_title.strip().lower() == "none":
-            page_title = commit_title or 'New ADR'
-        # 3. Create the ADR subpage (in UP space, parented under ADR parent page)
+            page_title = commit_title or 'Code Commit Summary'
+        # 3. Create the Code Commit page (in UP space, under Code Commits folder)
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
-        parent_id = parent_adr_page_id or os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+        folder_id = parent_folder_id or os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
         base_url = os.getenv("CONFLUENCE_BASE_URL")
-        # Confluence API: create child page by specifying ancestors
-        from theo.tools.confluence import markdown_to_confluence_storage
-        content_html = markdown_to_confluence_storage(adr_content)
-        user = os.getenv("CONFLUENCE_ADMIN_USER")
-        api_token = os.getenv("CONFLUENCE_API_TOKEN")
-        url = f"{base_url}/rest/api/content/"
-        data = {
-            "type": "page",
-            "title": page_title,
-            "ancestors": [{"id": str(parent_id)}],
-            "space": {"key": space_key},
-            "body": {
-                "storage": {
-                    "value": content_html,
-                    "representation": "storage"
-                }
-            }
-        }
-        resp = requests.post(url, json=data, auth=(user, api_token))
-        resp.raise_for_status()
-        new_page = resp.json()
-        new_page_id = new_page.get("id")
-        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id else ""
-        # 4. Add a new row to the ADR Index table
-        # Columns: Title (link), Status, Date, Authors, Source
-        date_str = date if isinstance(date, str) else datetime.utcnow().strftime("%Y-%m-%d")
-        title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
-        status_cell = '✅ Merged'
-        authors_cell = 'LLM'
-        source_cell = 'GitHub'
-        new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
-        add_row_to_adr_index(parent_id, new_row)
-        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
+        # Use the updated create_confluence_page function with parent_id support
+        confluence_response = create_confluence_page(
+            page_title, 
+            commit_content, 
+            space_key=space_key,
+            parent_id=folder_id
+        )
+        new_page_id = confluence_response.get("id")
+        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id and base_url else ""
+        return {"commit_page_id": new_page_id, "commit_page_url": new_page_url, "commit_title": page_title}
 
     def update_tbikb_for_model_changes(self, changed_models, commit_info, push_date=None):
         """
@@ -1235,12 +1211,12 @@ class Theo():
         confluence_url = f"{base_url}/pages/viewpage.action?pageId={page_id}" if page_id and base_url else ""
         return {"tbikb_page_id": page_id, "tbikb_page_url": confluence_url, "tbikb_title": title}
 
-    def create_adr_from_github_push(self, commits, push_info, parent_adr_page_id=None):
+    def create_code_commit_from_github_push(self, commits, push_info, parent_folder_id=None):
         """
-        Create a single ADR subpage and update the ADR Index table in Confluence for a GitHub push event (all commits summarized).
+        Create a single Code Commit page in Confluence for a GitHub push event (all commits summarized).
         """
         import litellm
-        from theo.tools.confluence import create_confluence_page, add_row_to_adr_index, markdown_to_confluence_storage
+        from theo.tools.confluence import create_confluence_page, markdown_to_confluence_storage
         from datetime import datetime
         import os, re
         model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "unknown")
@@ -1253,26 +1229,26 @@ class Theo():
                 f"Commit: {commit.get('id', '')}\nTitle: {commit_title}\nBody: {commit_message}\nURL: {commit.get('url', '')}\nAuthor: {commit.get('author', {}).get('name', 'Unknown')}\nDate: {commit.get('timestamp', '')}\n"
             )
         summary_str = "\n---\n".join(commit_summaries)
-        adr_prompt = (
-            "You are a technical writer. Draft a single Architecture Decision Record (ADR) summarizing the following code push. "
-            "Summarize the context, decisions, alternatives, and consequences for all included commits. Use a clear, professional tone. "
-            "Include a summary table if appropriate.\n\n"
+        code_commit_prompt = (
+            "You are a technical writer. Create a detailed summary of the following code push/commits. "
+            "Document what changed, why it changed, and any important implementation details. Use a clear, professional tone. "
+            "Structure the content for easy reference by developers.\n\n"
             f"Push info: {push_info}\n\nCommits:\n{summary_str}"
         )
         response = litellm.completion(
             model=model,
             messages=[
                 {"role": "system", "content": "You are a technical writer."},
-                {"role": "user", "content": adr_prompt}
+                {"role": "user", "content": code_commit_prompt}
             ]
         )
-        adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
-        if not adr_content or adr_content == "None":
-            adr_content = f"ADR for code push:\n\n{summary_str}"
-        # 2. Generate a concise ADR page title
+        commit_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+        if not commit_content or commit_content == "None":
+            commit_content = f"Code Commit Summary:\n\n{summary_str}"
+        # 2. Generate a concise page title
         title_prompt = (
-            "Given the following ADR content, generate a concise, descriptive Confluence page title.\n\n"
-            f"Content:\n{adr_content}\n"
+            "Given the following code commit content, generate a concise, descriptive Confluence page title.\n\n"
+            f"Content:\n{commit_content}\n"
         )
         response = litellm.completion(
             model=model,
@@ -1285,41 +1261,25 @@ class Theo():
         if page_title:
             page_title = re.sub(r'^[\'\"]+|[\'\"]+$', '', page_title.strip())
         if not page_title or page_title.strip().lower() == "none":
-            page_title = "ADR for code push"
-        # 3. Create the ADR subpage (in UP space, parented under ADR parent page)
+            page_title = "Code Commit Summary"
+        # 3. Create the Code Commit page (in UP space, under Code Commits folder)
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
-        parent_id = parent_adr_page_id or os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+        folder_id = parent_folder_id or os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
         base_url = os.getenv("CONFLUENCE_BASE_URL")
-        content_html = markdown_to_confluence_storage(adr_content)
+        content_html = markdown_to_confluence_storage(commit_content)
         user = os.getenv("CONFLUENCE_ADMIN_USER")
         api_token = os.getenv("CONFLUENCE_API_TOKEN")
         url = f"{base_url}/rest/api/content/"
-        data = {
-            "type": "page",
-            "title": page_title,
-            "ancestors": [{"id": str(parent_id)}],
-            "space": {"key": space_key},
-            "body": {
-                "storage": {
-                    "value": content_html,
-                    "representation": "storage"
-                }
-            }
-        }
-        resp = requests.post(url, json=data, auth=(user, api_token))
-        resp.raise_for_status()
-        new_page = resp.json()
-        new_page_id = new_page.get("id")
-        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id else ""
-        # 4. Add a new row to the ADR Index table
-        date_str = datetime.utcnow().isoformat()
-        title_cell = f'<a href="{new_page_url}" title="{new_page_url}">{page_title}</a>'
-        status_cell = '✅ Merged'
-        authors_cell = 'LLM'
-        source_cell = 'GitHub'
-        new_row = [title_cell, status_cell, date_str, authors_cell, source_cell]
-        add_row_to_adr_index(parent_id, new_row)
-        return {"adr_page_id": new_page_id, "adr_page_url": new_page_url, "adr_title": page_title}
+        # Use the updated create_confluence_page function with parent_id support
+        confluence_response = create_confluence_page(
+            page_title, 
+            commit_content, 
+            space_key=space_key,
+            parent_id=folder_id
+        )
+        new_page_id = confluence_response.get("id")
+        new_page_url = f"{base_url}/pages/viewpage.action?pageId={new_page_id}" if new_page_id and base_url else ""
+        return {"commit_page_id": new_page_id, "commit_page_url": new_page_url, "commit_title": page_title}
 
     def _is_schema_change(self, diff_text):
         """

@@ -18,13 +18,14 @@ title_generation: |
   Content:
   {doc_content}
 
-adr_single_commit: |
-  IMPORTANT: Do NOT use tables. Use only a bullet list for the summary. If you use a table, your answer will be discarded.
-  For the summary section, use this format (not a table):
-  - Decision: ... Consequence: ...
-  - ...
-
-  You are a technical writer. Draft an Architecture Decision Record (ADR) for the following code change. Summarize the context, decision, alternatives, and consequences. Use a clear, professional tone.
+code_commit_single: |
+  You are a technical writer. Create a detailed summary of this code commit. Document what changed, why it changed, and any important implementation details. Use a clear, professional tone.
+  
+  Structure your response to include:
+  - Overview of changes
+  - Technical details  
+  - Implementation notes
+  - Any potential impacts
 
   Commit title: {commit_title}
   Commit body: {commit_body}
@@ -33,8 +34,8 @@ adr_single_commit: |
   Date: {date}
   Diff URL: {diff_url}
 
-adr_multiple_commits: |
-  You are a technical writer. Draft a single Architecture Decision Record (ADR) summarizing the following code push. Summarize the context, decisions, alternatives, and consequences for all included commits. Use a clear, professional tone. Include a summary table if appropriate.
+code_commit_multiple: |
+  You are a technical writer. Create a comprehensive summary of the following code push/commits. Document what changed, why it changed, and any important implementation details. Use a clear, professional tone. Structure the content for easy reference by developers.
 
   Push info: {push_info}
 

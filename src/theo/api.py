@@ -299,7 +299,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     if payload.get("ref") in ["refs/heads/main", "refs/heads/PD-7618"] and "commits" in payload:
         def process_github_push(payload):
             theo = Theo()
-            parent_adr_page_id = os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID", "2117566465")
+            parent_code_commits_folder_id = os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
             commits = payload["commits"]
             push_info = {
                 "pusher": payload.get("pusher", {}),
@@ -308,8 +308,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 "ref": payload.get("ref"),
                 "repository": payload.get("repository", {}).get("full_name", "")
             }
-            # Create a single ADR for the push
-            adr_result = theo.create_adr_from_github_push(commits, push_info, parent_adr_page_id=parent_adr_page_id)
+            # Create a single Code Commit page for the push
+            code_commit_result = theo.create_code_commit_from_github_push(commits, push_info, parent_folder_id=parent_code_commits_folder_id)
             # Collect all .model.ts changes across all commits
             all_model_changes = []
             for commit in commits:

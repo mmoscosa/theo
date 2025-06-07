@@ -58,7 +58,7 @@ def update_confluence_page(page_id, new_content):
     logging.info(f"[Confluence] Page {page_id} updated successfully.")
     return put_resp.json()
 
-def create_confluence_page(title, content, space_key=None):
+def create_confluence_page(title, content, space_key=None, parent_id=None):
     base_url = os.getenv("CONFLUENCE_BASE_URL")
     if space_key is None:
         space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
@@ -80,6 +80,9 @@ def create_confluence_page(title, content, space_key=None):
             }
         }
     }
+    # Add parent page if specified
+    if parent_id:
+        data["ancestors"] = [{"id": str(parent_id)}]
     # Check for duplicate title before creating
     try:
         from theo.tools.confluence import get_all_confluence_pages, update_confluence_page
@@ -137,46 +140,5 @@ def get_confluence_page_by_id(page_id):
     resp.raise_for_status()
     return resp.json()
 
-def add_row_to_adr_index(page_id, new_row):
-    """
-    Add a new row to the ADR Index table in the given Confluence page.
-    new_row: list of HTML strings for each column (Title, Status, Date, Authors, Source)
-    """
-    page = get_confluence_page_by_id(page_id)
-    current_content = page["body"]["storage"]["value"]
-    version = page["version"]["number"] + 1
-    title = page["title"]
-
-    # Find the ADR Index table (assume first <table> after 'ADR Index' heading)
-    table_pattern = re.compile(r'(<h[1-6][^>]*>[^<]*ADR Index[^<]*</h[1-6]>)(.*?<table[\s\S]*?</table>)', re.IGNORECASE)
-    match = table_pattern.search(current_content)
-    if not match:
-        raise ValueError("ADR Index table not found in the page content.")
-    table_html = match.group(2)
-
-    row_html = "<tr>" + "".join(f"<td>{cell}</td>" for cell in new_row) + "</tr>"
-    # Insert after the first <tr> (header row)
-    updated_table = re.sub(r'(<tr>.*?</tr>)', r'\g<1>' + row_html, table_html, count=1)
-
-    # Replace the old table with the updated one
-    updated_content = current_content.replace(table_html, updated_table)
-
-    # Update the page
-    base_url = os.getenv("CONFLUENCE_BASE_URL")
-    user = os.getenv("CONFLUENCE_ADMIN_USER")
-    api_token = os.getenv("CONFLUENCE_API_TOKEN")
-    data = {
-        "version": {"number": version},
-        "title": title,
-        "type": "page",
-        "body": {
-            "storage": {
-                "value": updated_content,
-                "representation": "storage"
-            }
-        }
-    }
-    put_resp = requests.put(f"{base_url}/rest/api/content/{page_id}", json=data, auth=(user, api_token))
-    put_resp.raise_for_status()
-    logging.info(f"[Confluence] ADR Index updated for page {page_id}.")
-    return put_resp.json() 
+# Note: ADR Index functionality has been removed as we've transitioned from ADR pages to Code Commit pages
+# Code commits are now stored directly in the Code Commits folder without requiring index tables 
