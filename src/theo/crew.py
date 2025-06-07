@@ -778,9 +778,7 @@ class Theo():
                     code = re.sub(r'^```[a-zA-Z]+\n', '```\n', code, flags=re.MULTILINE)
                     # Only wrap if not already in a code block
                     if not code.strip().startswith('```'):
-                        return f'```
-{code.strip()}
-```'
+                        return f'```\n{code.strip()}\n```'
                     return code
                 return json_pattern.sub(replacer, text)
             main_content = format_json_code_blocks(main_content)
