@@ -767,6 +767,20 @@ class Theo():
             print(f"[DEBUG] LLM raw output: {main_content}")
             main_content = markdown_to_slack(main_content)
             
+            # Always format JSON examples as code blocks for Slack
+            import re
+            def format_json_code_blocks(text):
+                # Find JSON blocks (simple heuristic: lines that look like JSON)
+                json_pattern = re.compile(r'(\{\s*\n(?:[^\n]*\n)+?\})', re.MULTILINE)
+                def replacer(match):
+                    code = match.group(1)
+                    # Only wrap if not already in a code block
+                    if not code.strip().startswith('```'):
+                        return f'```json\n{code.strip()}\n```'
+                    return code
+                return json_pattern.sub(replacer, text)
+            main_content = format_json_code_blocks(main_content)
+            
             # Suppress sources if answer is general knowledge or not found in docs
             general_knowledge_phrases = [
                 "no direct mention in provided documentation",
@@ -778,11 +792,8 @@ class Theo():
                 "not available in documentation"
             ]
             if any(phrase in main_content.lower() for phrase in general_knowledge_phrases):
-                # Remove any existing Sources lines
-                import re
-                sources_pattern = r'Sources:\s*(<[^>]+\|\[[0-9]+\]>\s*)*|Sources:\s*(\[[0-9,\s\[\]]+\]|\[[0-9]+\](?:\s*\[[0-9]+\])*)'
-                main_content = re.sub(sources_pattern, "", main_content)
-                print(f"[DEBUG] Suppressed all source links due to general knowledge answer")
+                # Remove any existing Sources line
+                main_content = re.sub(r"Sources:.*", "", main_content)
             elif sources and any(source for source in sources if source):
                 valid_sources = [source for source in sources if source and source != "[No content in results]"]
                 print(f"[DEBUG] Valid sources found: {valid_sources}")
