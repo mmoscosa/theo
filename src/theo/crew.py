@@ -324,14 +324,14 @@ class Theo():
             doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if not doc_content or doc_content == "None":
                 doc_content = "Documentation could not be generated."
-            
-            # Validate content completion and strip EOF marker
-            if "~EOF~" in doc_content:
-                doc_content = doc_content.replace("~EOF~", "").strip()
-                print(f"[DEBUG] Documentation content completed successfully (EOF marker found)")
+            # Ensure ~EOF~ is present at the end
+            doc_content = doc_content.rstrip()
+            if not doc_content.endswith("~EOF~"):
+                doc_content += "\n~EOF~"
             else:
-                print(f"[WARNING] Documentation content may be truncated (no EOF marker found)")
-                doc_content += "\n\n*Note: This documentation may be incomplete due to generation limits.*"
+                # Remove any extra content after ~EOF~
+                doc_content = doc_content[:doc_content.find("~EOF~") + 5]
+            print(f"[DEBUG] Documentation content completed and ends with EOF marker")
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": doc_prompt}],
                 output_data=[{"role": "assistant", "content": doc_content}],
@@ -339,7 +339,7 @@ class Theo():
             )
         except Exception as e:
             print(f"[ERROR] Technical Writer LLM call failed: {e}")
-            doc_content = "Documentation could not be generated."
+            doc_content = "Documentation could not be generated.\n~EOF~"
         # Generate a concise, descriptive page title
         title_prompt = self.technical_writer_prompts["title_generation"] \
             .replace("{doc_content}", doc_content or "")
@@ -472,7 +472,13 @@ class Theo():
             from theo.tools.confluence import create_confluence_page
             summary_title = f"Summary for: {page_title}"
             summary_content = f"Summary of conversation for supervisor context:\n\n{context_summary}\n\nKey points:\n{doc_content}"
-            print(f"[DEBUG] Creating/Updating General Knowledge in TKB space.")
+            # Ensure ~EOF~ at the end of summary_content
+            summary_content = summary_content.rstrip()
+            if not summary_content.endswith("~EOF~"):
+                summary_content += "\n~EOF~"
+            else:
+                summary_content = summary_content[:summary_content.find("~EOF~") + 5]
+            print(f"[DEBUG] Creating/Updating General Knowledge in TKB space with EOF marker.")
             create_confluence_page(summary_title, summary_content, space_key=os.getenv("CONFLUENCE_SPACE_KEY_TKB", "TKB"))
         # Return the correct Slack message
         if not close_conversation:
