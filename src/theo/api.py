@@ -71,10 +71,10 @@ def route_event_to_crew(event_type: str, payload: dict, parent_span=None, thread
         print(f"[DEBUG] Asking Supervisor agent to route message: {user_message}")
         supervisor_result = theo.supervisor_routing(question=user_message, conversation_id=conversation_id, thread_history=thread_history)
         print(f"[DEBUG] Supervisor agent LLM output: {supervisor_result}")
-        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "clarification_needed"}
+        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
         # Handle supervisor health/heartbeat direct response
-        if isinstance(supervisor_result, tuple) and supervisor_result[0] == "supervisor_health":
-            return {"result": supervisor_result[1], "task": "supervisor_health", "conversation_id": conversation_id}
+        if isinstance(supervisor_result, tuple) and supervisor_result[0] in ("supervisor_health", "platform_health"):
+            return {"result": supervisor_result[1], "task": supervisor_result[0], "conversation_id": conversation_id}
         # If supervisor_result is a dict, unpack for bi_report or documentation_update
         if isinstance(supervisor_result, dict):
             task_name = supervisor_result.get("task_name")
@@ -250,11 +250,11 @@ async def slack_events(request: Request):
     if channel and parent_ts:
         add_slack_reaction(channel, parent_ts, "robot_face")
         add_slack_reaction(channel, parent_ts, "hourglass_flowing_sand")
-        # Add :thinking_face: to last user message in thread, but not if it's the root message
+        # Add :loading-circle: to last user message in thread, but not if it's the root message
         thread_history_for_reaction = fetch_thread_history(channel, parent_ts)
         last_user_ts = get_last_user_message_ts(thread_history_for_reaction, SLACK_BOT_USER_ID)
         if last_user_ts and last_user_ts != parent_ts:
-            add_slack_reaction(channel, last_user_ts, "thinking_face")
+            add_slack_reaction(channel, last_user_ts, "loading-circle")
     try:
         with tracer.start_span("conversation.workflow", service="theo", resource="slack_event") as parent_span:
             parent_span.set_tag("conversation.id", parent_ts)
@@ -271,6 +271,7 @@ async def slack_events(request: Request):
                 thread_history = fetch_thread_history(channel, parent_ts)
             supervisor_response = await handle_event_with_supervisor("slack", payload, parent_span=parent_span, thread_history=thread_history)
             answer = supervisor_response.get("result") or "No answer generated."
+            print(f"[DEBUG] Slack message to be sent: {answer}")
             if channel and answer and not answer.startswith("Ignoring bot's own message") and not answer.startswith("Bot not mentioned") and not answer.startswith("Ignoring Slack event type"):
                 send_slack_message(channel, answer, thread_ts=parent_ts)
     except Exception as e:
@@ -284,11 +285,11 @@ async def slack_events(request: Request):
         # Always remove hourglass after processing, unless this was a reaction_added event
         if event.get("type") != "reaction_added" and channel and parent_ts:
             remove_slack_reaction(channel, parent_ts, "hourglass_flowing_sand")
-            # Remove :thinking_face: from last user message, but not if it's the root message
+            # Remove :loading-circle: from last user message, but not if it's the root message
             thread_history_for_reaction = fetch_thread_history(channel, parent_ts)
             last_user_ts = get_last_user_message_ts(thread_history_for_reaction, SLACK_BOT_USER_ID)
             if last_user_ts and last_user_ts != parent_ts:
-                remove_slack_reaction(channel, last_user_ts, "thinking_face")
+                remove_slack_reaction(channel, last_user_ts, "loading-circle")
     return JSONResponse({"message": "Slack event received", "supervisor_response": supervisor_response}, status_code=status.HTTP_200_OK)
 
 @app.post("/github/webhook")

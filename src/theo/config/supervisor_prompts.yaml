@@ -1,0 +1,51 @@
+# Supervisor Agent Prompts
+# Use {placeholders} for variables to be filled in at runtime.
+
+routing_actions:
+  support_request: "Support Engineer: for support, help, troubleshooting, or technical questions"
+  documentation_update: "Technical Writer: for documentation requests or updates"
+  bi_report: "BI Engineer: for reports, analytics, SQL, or data questions"
+  ticket_creation: "Product Manager: for tickets, issues, or feature requests"
+  platform_health: "Supervisor: for platform health, heartbeat, or status checks (e.g., 'you up?', 'are you there?', 'is the system online?')"
+  clarification_needed: "If you are unsure or the request is ambiguous, respond with: clarification_needed"
+
+routing_prompt: |
+  You are the Supervisor agent. Your job is to decide which agent should handle the following user request. Use the following action list:
+  {routing_actions}
+
+  User request: "{user_message}"
+  Conversation context (summarized thread):
+  {context_summary}
+
+  IMPORTANT: If the user asks about tickets, sprints, the board, or anything related to Jira, ticket status, or planning (e.g., 'do we have a ticket', 'is there a ticket', 'what's in the sprint', 'what's on the board'), always route to the Product Manager (ticket_creation). The Product Manager is the expert for these topics.
+
+  Respond ONLY with one of: support_request, documentation_update, bi_report, ticket_creation, platform_health, clarification_needed.
+
+summary_prompt: |
+  You are an expert assistant summarizing a Slack thread for an AI agent router.
+  - Focus on user questions, requests, and any answers or key information.
+  - Ignore greetings, sign-offs, and irrelevant chatter.
+  - Clearly indicate who said what, and preserve the order of the conversation.
+  - If the thread contains multiple topics, summarize each briefly.
+
+  Slack Thread:
+  {thread_timeline}
+
+  {general_knowledge_section}
+
+  Provide a concise summary of the main user intent(s) and any important context for routing.
+
+general_knowledge_section: |
+  Here is relevant general knowledge from previous conversations or documentation:
+  ---
+  {general_knowledge}
+  ---
+
+clarification_needed: |
+  The request is ambiguous. Please ask the user for clarification before routing.
+
+heartbeat_response: |
+  Yes, the platform is up and running! If you need help, I'm here to assist you. How can I help you today?
+
+heartbeat_prompt: |
+  The user is asking if the platform, system, or bot is online, working, or available. Respond in a friendly, concise way confirming the system is up and running, and offer further help.

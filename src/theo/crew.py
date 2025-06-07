@@ -37,6 +37,9 @@ from theo.tools.confluence import update_confluence_page, create_confluence_page
 import html
 import requests
 from datetime import datetime
+from theo.config import load_yaml_config
+import pytz
+import sqlalchemy  # or your DB driver of choice
 
 # Global set to track which threads have updated TBIKB
 updated_tbikb_threads = set()
@@ -51,10 +54,13 @@ class Theo():
 
     agents: List[BaseAgent]
     tasks: List[Task]
+    
+    # Override the default tasks config path to avoid looking for tasks.yaml
+    tasks_config = None
 
     # Learn more about YAML configuration files here:
     # Agents: https://docs.crewai.com/concepts/agents#yaml-configuration-recommended
-    # Tasks: https://docs.crewai.com/concepts/tasks#yaml-configuration-recommended
+    # Tasks: We don't use YAML tasks - all tasks are handled via direct method calls
     
     # If you would like to add tools to your agents, you can learn more about it here:
     # https://docs.crewai.com/concepts/agents#agent-tools
@@ -95,16 +101,33 @@ class Theo():
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.supervisor_model = os.getenv("AGENT_SUPERVISOR_MODEL", "gemini/gemini-2.5-pro-exp-03-25")
+        self.supervisor_model = os.getenv("AGENT_SUPERVISOR_MODEL", "gemini/gemini-2.0-flash-exp")
         self.support_engineer_model = os.getenv("AGENT_SUPPORT_ENGINEER_MODEL", "anthropic/claude-3-5-sonnet-20240620")
         self.technical_writer_model = os.getenv("AGENT_TECHNICAL_WRITER_MODEL", "gpt-4o")
-        self.bi_engineer_model = os.getenv("AGENT_BI_ENGINEER_MODEL", "openai/o3")
-        self.product_manager_model = os.getenv("AGENT_PRODUCT_MANAGER_MODEL", "gemini/gemini-2.5-pro-exp-03-25")
+        self.bi_engineer_model = os.getenv("AGENT_BI_ENGINEER_MODEL", "anthropic/claude-3-5-sonnet-20240620")
+        self.product_manager_model = os.getenv("AGENT_PRODUCT_MANAGER_MODEL", "gemini/gemini-2.0-flash-exp")
+        # Load agent and prompt configs from YAML
+        self.agents_config = load_yaml_config('agents.yaml')
+        self.supervisor_prompts = load_yaml_config('supervisor_prompts.yaml')
+        self.support_prompts = load_yaml_config('support_prompts.yaml')
+        self.technical_writer_prompts = load_yaml_config('technical_writer_prompts.yaml')
+        self.bi_engineer_prompts = load_yaml_config('bi_engineer_prompts.yaml')
+        self.product_manager_prompts = load_yaml_config('product_manager_prompts.yaml')
+        
+        # Since we don't use YAML-defined tasks, create empty tasks list
+        self.tasks = []
 
     def summarize_thread(self, thread_history, question=None):
         """Summarize a Slack thread using the supervisor's LLM model, and include relevant general knowledge from Bedrock only if useful."""
         model = os.getenv("AGENT_SUPERVISOR_MODEL", "unknown")
         bedrock = BedrockClient()
+        def is_substantive(text):
+            # Filter out greetings, sign-offs, and very short/irrelevant messages
+            if not text or len(text.strip()) < 2:
+                return False
+            text_lower = text.strip().lower()
+            greetings = ["hi", "hello", "hey", "thanks", "thank you", "ok", "cool", "bye", "goodbye", ":thumbsup:", ":wave:"]
+            return not any(text_lower == g for g in greetings)
         def extract_message_text(msg):
             if msg.get("text"):
                 return msg["text"]
@@ -120,10 +143,23 @@ class Theo():
                                     if "text" in subel
                                 )
             return ""
-        all_msgs = [extract_message_text(msg) for msg in thread_history if extract_message_text(msg)]
-        thread_text = "\n".join(all_msgs)
-        # Query general knowledge base with the question and thread context
-        general_kb_query = question or thread_text
+        # Build thread_timeline: [timestamp] User: message
+        timeline = []
+        for msg in thread_history or []:
+            text = extract_message_text(msg)
+            if not is_substantive(text):
+                continue
+            ts = msg.get("ts")
+            try:
+                # Slack timestamps are floats as strings (epoch seconds)
+                dt = datetime.fromtimestamp(float(ts)) if ts else None
+                ts_str = dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+            except Exception:
+                ts_str = ts or ""
+            user = msg.get("user") or msg.get("username") or ("Bot" if msg.get("bot_id") else "User")
+            timeline.append(f"[{ts_str}] {user}: {text.strip()}")
+        thread_timeline = "\n".join(timeline)
+        general_kb_query = question or thread_timeline
         general_knowledge = bedrock.search_general_knowledge(general_kb_query)
         print(f"[DEBUG] GeneralKnowledge KB result: {general_knowledge}")
         # Only include general knowledge if it is non-empty, not an error, and not a 'no results' message
@@ -136,16 +172,12 @@ class Theo():
         ):
             general_knowledge_section = ""
         else:
-            general_knowledge_section = (
-                f"\nHere is relevant general knowledge from previous conversations or documentation:\n---\n{general_knowledge}\n---\n"
-            )
+            general_knowledge_section = self.supervisor_prompts["general_knowledge_section"].replace("{general_knowledge}", general_knowledge)
         @llm(model_name=model, name="supervisor_thread_summary", model_provider="openai")
         def _llm_call():
-            prompt = (
-                f"Summarize the following Slack thread for context. Focus on user questions, requests, and key information.\n\n"
-                f"Messages:\n{thread_text}\n"
-                f"{general_knowledge_section}"
-            )
+            prompt = self.supervisor_prompts["summary_prompt"] \
+                .replace("{thread_timeline}", thread_timeline) \
+                .replace("{general_knowledge_section}", general_knowledge_section)
             summary = ""
             try:
                 summary = LLMObs.annotate(
@@ -157,7 +189,7 @@ class Theo():
                 summary = None
             # Defensive: always return a real string, never None or 'None'
             if not summary or summary == "None":
-                summary = thread_text[:1000]  # Use the actual messages as fallback
+                summary = thread_timeline[:1000]  # Use the actual messages as fallback
             return summary if isinstance(summary, str) else str(summary)
         return _llm_call()
 
@@ -187,7 +219,7 @@ class Theo():
             "conversation_id": conversation_id
         })
         # If supervisor_health, return the tuple directly
-        if answer_clean == "supervisor_health":
+        if answer_clean in ("supervisor_health", "platform_health"):
             return result
         # For bi_report and documentation_update, pass both summary and raw thread
         if answer_clean == "bi_report" or answer_clean == "documentation_update":
@@ -269,12 +301,9 @@ class Theo():
                 if text:
                     timeline.append(f"[{ts}] {user}: {text}")
         timeline_str = "\n".join(timeline) if timeline else "No timeline available."
-        doc_prompt = (
-            "You are a technical writer. Write a clear, professional, and well-structured technical documentation page based on the following conversation and summary. The documentation should be suitable for both product and engineering team members. Do not include Slack formatting, agent signatures, or conversational filler.\n\n"
-            f"Conversation context:\n{timeline_str}\n\n"
-            f"Summary:\n{context_summary}\n\n"
-            "Write only the documentation content."
-        )
+        doc_prompt = self.technical_writer_prompts["documentation_update"] \
+            .replace("{timeline}", timeline_str) \
+            .replace("{context_summary}", context_summary or "")
         import litellm
         from ddtrace.llmobs import LLMObs
         # Generate documentation content
@@ -298,10 +327,8 @@ class Theo():
             print(f"[ERROR] Technical Writer LLM call failed: {e}")
             doc_content = "Documentation could not be generated."
         # Generate a concise, descriptive page title
-        title_prompt = (
-            "Given the following documentation content, generate a concise, descriptive Confluence page title suitable for both product and engineering audiences.\n\n"
-            f"Content:\n{doc_content}\n"
-        )
+        title_prompt = self.technical_writer_prompts["title_generation"] \
+            .replace("{doc_content}", doc_content or "")
         try:
             response = litellm.completion(
                 model=model,
@@ -482,7 +509,7 @@ class Theo():
 
         return Crew(
             agents=self.agents, # Automatically created by the @agent decorator
-            tasks=self.tasks, # Automatically created by the @task decorator
+            tasks=self.tasks or [], # Empty list since we handle tasks via direct method calls
             process=Process.sequential,
             verbose=True,
             # process=Process.hierarchical, # In case you wanna use that instead https://docs.crewai.com/how-to/Hierarchical/
@@ -490,8 +517,10 @@ class Theo():
 
     def support_engineer_answer(self, question, conversation_id=None, context_summary=None, thread_history=None):
         import litellm
+        from datetime import datetime
+        import pytz
         bedrock = BedrockClient()
-        agent_role = "Support Engineer"
+        agent_role = self.agents_config['support_engineer']['role']
         agent_emoji = "👨‍💻"
         category_emoji = "📄"
         category_title = "Support Request"
@@ -500,31 +529,33 @@ class Theo():
         context_summary_clean = "" if context_summary in (None, "None") else context_summary
         docs = bedrock.search_code_documentation(question)
         print(f"[DEBUG] Bedrock docs: {docs}")
-        llm_prompt = (
-            f"You are a Support Engineer.\n"
-            f"A user asked: '{question}'\n"
-            f"\nHere is relevant documentation:\n---\n{docs}\n---\n"
-            f"Conversation context (summarized thread):\n{context_summary_clean}\n"
-            f"Using the documentation above, answer the user's question in a clear, concise, and user-friendly way. "
-            f"If the answer is not directly in the documentation, say so and suggest next steps.\n"
-            f"Format your answer for Slack, using bullet points or sections if helpful."
-        )
+        # Get current date/time in Central Time
+        tz = pytz.timezone("America/Chicago")
+        now = datetime.now(tz)
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M %Z")
+        # Use YAML prompt for support
+        llm_prompt = self.support_prompts["main_prompt"] \
+            .replace("{question}", question or "") \
+            .replace("{documentation}", docs or "") \
+            .replace("{context_summary}", context_summary_clean or "") \
+            .replace("{current_date}", current_date) \
+            .replace("{current_time}", current_time)
         print(f"[DEBUG] LLM prompt sent to support engineer:\n{llm_prompt}")
         from ddtrace.llmobs import LLMObs
         try:
             response = litellm.completion(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "You are a Support Engineer."},
+                    {"role": "system", "content": agent_role},
                     {"role": "user", "content": llm_prompt}
                 ]
             )
             main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
             if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                main_content = "Sorry, I couldn't find a relevant answer in the documentation. Please provide more details or contact support."
-            # Log to LLMObs for observability
+                main_content = self.support_prompts["no_answer_found"]
             LLMObs.annotate(
-                input_data=[{"role": "system", "content": "You are a Support Engineer."}, {"role": "user", "content": llm_prompt}],
+                input_data=[{"role": "system", "content": agent_role}, {"role": "user", "content": llm_prompt}],
                 output_data=[{"role": "assistant", "content": main_content}],
                 tags={"agent_role": agent_role, "model_provider": model_provider}
             )
@@ -532,7 +563,7 @@ class Theo():
             main_content = markdown_to_slack(main_content)
         except Exception as e:
             print(f"[ERROR] LLM call failed: {e}")
-            main_content = "Sorry, I couldn't find a relevant answer in the documentation. Please provide more details or contact support."
+            main_content = self.support_prompts["no_answer_found"]
         return format_slack_response(
             category_emoji=category_emoji,
             category_title=category_title,
@@ -567,25 +598,21 @@ class Theo():
 
     def supervisor_answer(self, question, conversation_id=None, context_summary=None):
         from theo.tools.slack import format_slack_response
-        agent_role = "Supervisor"
+        agent_role = self.agents_config['supervisor']['role']
         agent_emoji = ":shield:"
         category_emoji = ":satellite_antenna:"
         category_title = "Platform Health"
         model = self.supervisor_model
         model_provider = get_model_provider("AGENT_SUPERVISOR_MODEL", "AGENT_SUPERVISOR_PROVIDER")
         context_summary = context_summary or ""
-        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "clarification_needed"}
+        valid_tasks = {"support_request", "documentation_update", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
 
         # Heartbeat/health check interception
         if self._is_heartbeat_question(question):
+            heartbeat_prompt = self.supervisor_prompts["heartbeat_prompt"]
+            prompt = heartbeat_prompt.replace("{user_message}", question or "")
             import litellm
             from ddtrace.llmobs import LLMObs
-            # Use LLM to generate a friendly confirmation
-            prompt = (
-                "A user asked if the platform is working, online, or available. "
-                "Respond with a short, friendly confirmation that the system is up and running. "
-                "Do not mention being an AI or bot. Format for Slack."
-            )
             try:
                 response = litellm.completion(
                     model=model,
@@ -594,14 +621,14 @@ class Theo():
                         {"role": "user", "content": prompt}
                     ]
                 )
-                main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else "Yes, the platform is up and running!"
+                main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else self.supervisor_prompts["heartbeat_response"]
                 LLMObs.annotate(
                     input_data=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}],
                     output_data=[{"role": "assistant", "content": main_content}],
                     tags={"agent_role": agent_role, "model_provider": model_provider, "action": "heartbeat_response"}
                 )
             except Exception as e:
-                main_content = "Yes, the platform is up and running!"
+                main_content = self.supervisor_prompts["heartbeat_response"]
             slack_message = format_slack_response(
                 category_emoji=category_emoji,
                 category_title=category_title,
@@ -609,37 +636,15 @@ class Theo():
                 agent_role=agent_role,
                 agent_emoji=agent_emoji
             )
-            # Return a special marker so the router knows not to pass to other agents
-            return ("supervisor_health", slack_message)
-        prompt = (
-            "You are an agent router. Your job is to select the most appropriate agent for each user request, based on the intent of the message.\n"
-            "\n"
-            "Agent mapping:\n"
-            "- support_request: for troubleshooting, help, errors, support, or general product/system questions\n"
-            "- bi_report: for reports, analytics, SQL, data, metrics\n"
-            "- documentation_update: for explicit requests to document, update documentation, write docs, or similar\n"
-            "- ticket_creation: for explicit requests to create, add, or file a ticket, bug, or feature\n"
-            "- clarification_needed: if the request is ambiguous or unclear\n"
-            "\n"
-            "Instructions:\n"
-            "- If the user's request is a follow-up in a thread, use the conversation context to determine the correct agent. Do not ask for clarification if the context makes the intent clear.\n"
-            "- Route to support_request for most user questions about how to use, troubleshoot, or understand a system, feature, or process, unless the user is explicitly asking for documentation to be written or updated.\n"
-            "- Route to documentation_update only if the user explicitly asks to document, update documentation, write docs, or similar.\n"
-            "- Route to bi_report for requests about reports, analytics, SQL, data, or metrics.\n"
-            "- Route to ticket_creation only for explicit requests to create, add, or file a ticket, bug, or feature.\n"
-            "- If you are unsure, choose clarification_needed.\n"
-            "\n"
-            "Examples:\n"
-            "- 'How does the PMSSync work?' => support_request\n"
-            "- 'Can you help me with PMSSync errors?' => support_request\n"
-            "- 'Update the onboarding docs' => documentation_update\n"
-            "- 'Can you give me a SQL query for user signups?' => bi_report\n"
-            "- 'Create a ticket for this bug' => ticket_creation\n"
-            "\n"
-            f"Conversation context (summarized thread):\n{context_summary}\n"
-            f"User request: {question}\n"
-            "\nRespond with ONLY one of: support_request, documentation_update, bi_report, ticket_creation, clarification_needed."
-        )
+            # Always return both keys for compatibility
+            return ("platform_health", slack_message)
+        # Format routing_actions for prompt injection
+        routing_actions_dict = self.supervisor_prompts.get("routing_actions", {})
+        routing_actions_str = "\n".join([f"- {k}: {v}" for k, v in routing_actions_dict.items()])
+        prompt = self.supervisor_prompts["routing_prompt"] \
+            .replace('{user_message}', question or '') \
+            .replace('{context_summary}', context_summary or '') \
+            .replace('{routing_actions}', routing_actions_str)
         print(f"[DEBUG] Supervisor LLM full prompt:\n{prompt}")
         import litellm
         from ddtrace.llmobs import LLMObs
@@ -656,7 +661,6 @@ class Theo():
                 answer = answer.strip().lower()
             else:
                 answer = "clarification_needed"
-            # Log to LLMObs for observability
             LLMObs.annotate(
                 input_data=[{"role": "system", "content": "You are an agent router."}, {"role": "user", "content": prompt}],
                 output_data=[{"role": "assistant", "content": answer}],
@@ -669,25 +673,38 @@ class Theo():
         except Exception as e:
             print(f"[ERROR] LLM call failed: {e}")
             answer = "clarification_needed"
-        # Heuristic fallback: if answer is clarification_needed but context_summary contains a recent support request, override to support_request
         if answer == "clarification_needed" and context_summary:
             lowered_context = context_summary.lower()
-            if ("support request" in lowered_context or "troubleshoot" in lowered_context or "error" in lowered_context or "help" in lowered_context):
+            ticket_keywords = ["ticket", "jira", "sprint", "board", "issue", "story", "bug", "hotfix", "task"]
+            if any(kw in lowered_context for kw in ticket_keywords) or any(kw in (question or '').lower() for kw in ticket_keywords):
+                print("[DEBUG] Heuristic fallback: context indicates ticket/board/sprint, overriding to ticket_creation")
+                answer = "ticket_creation"
+            elif ("support request" in lowered_context or "troubleshoot" in lowered_context or "error" in lowered_context or "help" in lowered_context):
                 print("[DEBUG] Heuristic fallback: context indicates support, overriding to support_request")
                 answer = "support_request"
         downstream_prompt = f"Conversation context (summarized thread):\n{context_summary}\n\nUser request: {question}"
+        if answer == "platform_health":
+            # Always use the heartbeat response for platform health
+            main_content = self.supervisor_prompts["heartbeat_response"]
+            slack_message = format_slack_response(
+                category_emoji=category_emoji,
+                category_title=category_title,
+                main_content=main_content,
+                agent_role=agent_role,
+                agent_emoji=agent_emoji
+            )
+            return ("platform_health", slack_message)
         return answer, downstream_prompt
 
     def technical_writer_answer(self, question, conversation_id=None, context_summary=None, thread_history=None):
         print(f"[DEBUG] technical_writer_answer called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}")
-        agent_role = "Technical Writer"
+        agent_role = self.agents_config['technical_writer']['role']
         agent_emoji = "📝"
         category_emoji = "📚"
         category_title = "Documentation Update"
         model = self.technical_writer_model
         @llm(model_name=model, name="technical_writer_answer", model_provider="anthropic")
         def _llm_call():
-            # Use the raw thread only as part of the LLM prompt, not in the Slack message
             timeline = []
             if thread_history:
                 for msg in thread_history:
@@ -697,23 +714,22 @@ class Theo():
                     if text:
                         timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
-            # Build a rich prompt for the LLM
+            # Use YAML task description for documentation update
+            base_prompt = self.supervisor_prompts["routing_prompt"]
             llm_prompt = (
-                f"You are a Technical Writer.\n"
+                f"{base_prompt}\n\n"
                 f"User question or documentation request: {question}\n"
                 f"Summary of conversation context: {context_summary}\n"
                 f"Conversation timeline:\n{timeline_str}\n"
                 f"Generate a clear, user-friendly documentation update or summary for the user."
             )
             print(f"[DEBUG] technical_writer_answer LLM prompt: {llm_prompt}")
-            # The LLM generates the main content, but only the answer and summary are sent to Slack
             main_content = LLMObs.annotate(
                 input_data=[{"role": "user", "content": llm_prompt}],
                 output_data=[{"role": "assistant", "content": ""}],
-                tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
+                tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": "anthropic"}
             )
             print(f"[DEBUG] technical_writer_answer LLM main_content: {main_content}")
-            # Only show the LLM's answer and summary in Slack, not the full timeline
             slack_message = format_slack_response(
                 category_emoji=category_emoji,
                 category_title=category_title,
@@ -727,7 +743,7 @@ class Theo():
 
     def bi_engineer_answer(self, question, conversation_id=None, context_summary=None, thread_history=None):
         print(f"[DEBUG] bi_engineer_answer called with question={question}, conversation_id={conversation_id}, context_summary={context_summary}, thread_history={thread_history}")
-        agent_role = "BI Engineer"
+        agent_role = self.agents_config['bi_engineer']['role']
         agent_emoji = "📊"
         category_emoji = "📈"
         category_title = "BI Report"
@@ -739,12 +755,9 @@ class Theo():
         import litellm
         import re
         def extract_table_names(text):
-            # Simple regex to match table names in quotes or camelCase/underscored words
             table_pattern = re.compile(r'"([a-zA-Z0-9_]+)"|\b([a-zA-Z][a-zA-Z0-9_]+)\b')
             matches = table_pattern.findall(text)
-            # Flatten and filter empty
             names = [m[0] or m[1] for m in matches if m[0] or m[1]]
-            # Remove common SQL keywords and duplicates
             keywords = {"select", "from", "where", "join", "on", "group", "by", "order", "limit", "as", "and", "or", "not", "in", "is", "null", "count", "sum", "avg", "min", "max", "left", "right", "inner", "outer", "having", "distinct", "case", "when", "then", "else", "end"}
             return [n for n in set(names) if n.lower() not in keywords]
         def _llm_call():
@@ -757,8 +770,6 @@ class Theo():
                     if text:
                         timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
-
-            # Try to extract table names from the question
             table_names = extract_table_names(question)
             print(f"[DEBUG] Extracted table names: {table_names}")
             schemas = []
@@ -766,33 +777,30 @@ class Theo():
                 schema = bedrock.search_db_schema(f"{table} schema")
                 if schema and "no results" not in schema.lower() and "error" not in schema.lower():
                     schemas.append((table, schema))
-            # If we found relevant schemas, build a focused prompt
+            base_prompt = self.bi_engineer_prompts["main_prompt"]
             if schemas:
                 schema_text = "\n\n".join([f"Schema for {t}:\n{s}" for t, s in schemas])
-                focused_prompt = (
-                    f"You are a BI Engineer.\n"
-                    f"User question: {question}\n"
-                    f"Summary of conversation context: {context_summary}\n"
-                    f"\nHere are the relevant database schemas:\n{schema_text}\n"
-                    f"Conversation timeline:\n{timeline_str}\n"
-                    f"Write a SQL query to answer the user's question using the schema(s) above. Then explain the query in plain English."
-                )
+                focused_prompt = base_prompt \
+                    .replace("{question}", question or "") \
+                    .replace("{context_summary}", context_summary or "") \
+                    .replace("{db_docs}", schema_text) \
+                    .replace("{timeline}", timeline_str)
+                focused_prompt += "\n" + self.bi_engineer_prompts["sql_generation"]
+                focused_prompt += "\n\n" + self.bi_engineer_prompts["business_analysis_template"]
                 print(f"[DEBUG] Focused LLM prompt: {focused_prompt}")
                 response = litellm.completion(
                     model=model,
-                    messages=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": focused_prompt}]
+                    messages=[{"role": "system", "content": agent_role}, {"role": "user", "content": focused_prompt}]
                 )
                 main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
                 if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                    main_content = ("Sorry, I could not generate a SQL query for your request. Please provide more details or check back later.")
-                # Log to LLMObs for observability
+                    main_content = self.bi_engineer_prompts["no_sql_generated"]
                 LLMObs.annotate(
-                    input_data=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": focused_prompt}],
+                    input_data=[{"role": "system", "content": agent_role}, {"role": "user", "content": focused_prompt}],
                     output_data=[{"role": "assistant", "content": main_content}],
                     tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
                 )
             else:
-                # Fallback to current logic
                 no_results = (
                     not db_docs or
                     "no results" in db_docs.lower() or
@@ -802,36 +810,32 @@ class Theo():
                 )
                 if no_results:
                     schema_info = bedrock.search_db_schema("utilityPartners schema")
-                    fallback_prompt = (
-                        f"You are a BI Engineer. The user asked: '{question}'.\n"
-                        f"Here is the schema for utilityPartners (if available):\n{schema_info}\n"
-                        f"If possible, generate a SQL query and a short report/summary to answer the user's question. "
-                        f"If you cannot generate a query, explain what information is missing."
-                    )
+                    fallback_prompt = base_prompt \
+                        .replace("{question}", question or "") \
+                        .replace("{context_summary}", context_summary or "") \
+                        .replace("{db_docs}", schema_info or "") \
+                        .replace("{timeline}", timeline_str)
+                    fallback_prompt += "\n\n" + self.bi_engineer_prompts["business_analysis_template"]
                     print(f"[DEBUG] Fallback LLM prompt: {fallback_prompt}")
                     response = litellm.completion(
                         model=model,
-                        messages=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": fallback_prompt}]
+                        messages=[{"role": "system", "content": agent_role}, {"role": "user", "content": fallback_prompt}]
                     )
                     main_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
                     if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                        main_content = ("Sorry, I could not find any relevant database schema or queries for your request. "
-                                        "Please provide more details or check back later.")
-                    # Log to LLMObs for observability
+                        main_content = self.bi_engineer_prompts["no_schema_found"]
                     LLMObs.annotate(
-                        input_data=[{"role": "system", "content": "You are a BI Engineer."}, {"role": "user", "content": fallback_prompt}],
+                        input_data=[{"role": "system", "content": agent_role}, {"role": "user", "content": fallback_prompt}],
                         output_data=[{"role": "assistant", "content": main_content}],
                         tags={"agent_role": agent_role, "conversation_id": conversation_id or "unknown", "model_provider": model_provider}
                     )
                 else:
-                    llm_prompt = (
-                        f"You are a BI Engineer.\n"
-                        f"User question: {question}\n"
-                        f"Summary of conversation context: {context_summary}\n"
-                        f"\nHere is relevant database schema and query documentation:\n---\n{db_docs}\n---\n"
-                        f"Conversation timeline:\n{timeline_str}\n"
-                        f"Generate a concise, context-aware BI report for the user."
-                    )
+                    llm_prompt = base_prompt \
+                        .replace("{question}", question or "") \
+                        .replace("{context_summary}", context_summary or "") \
+                        .replace("{db_docs}", db_docs or "") \
+                        .replace("{timeline}", timeline_str)
+                    llm_prompt += "\n\n" + self.bi_engineer_prompts["business_analysis_template"]
                     print(f"[DEBUG] bi_engineer_answer LLM prompt: {llm_prompt}")
                     main_content = LLMObs.annotate(
                         input_data=[{"role": "user", "content": llm_prompt}],
@@ -840,12 +844,11 @@ class Theo():
                     )
                     print(f"[DEBUG] bi_engineer_answer LLM main_content: {main_content}")
                     if not main_content or not isinstance(main_content, str) or main_content.strip().lower() == "none":
-                        main_content = ("Sorry, I could not find any relevant database schema or queries for your request. "
-                                        "Please provide more details or check back later.")
+                        main_content = self.bi_engineer_prompts["no_schema_found"]
             slack_message = format_slack_response(
                 category_emoji=category_emoji,
                 category_title=category_title,
-                main_content=main_content if isinstance(main_content, str) else str(main_content),
+                main_content=(main_content.replace('```sql', '```') if isinstance(main_content, str) else str(main_content).replace('```sql', '```')),
                 agent_role=agent_role,
                 agent_emoji=agent_emoji
             )
@@ -859,133 +862,175 @@ class Theo():
         from theo.tools.slack import send_slack_message
         import logging
         import re
-        agent_role = "Product Manager"
+        import json
+
+        agent_role = self.agents_config['product_manager']['role']
         agent_emoji = "📝"
         category_emoji = "📝"
         category_title = "Ticket Creation"
         model = self.product_manager_model
         model_provider = get_model_provider("AGENT_PRODUCT_MANAGER_MODEL", "AGENT_PRODUCT_MANAGER_PROVIDER")
-        admin_slack_user_id = os.getenv("ADMIN_SLACK_USER_ID")
-        admin_tag = f"<@{admin_slack_user_id}> " if admin_slack_user_id else ""
-        VALID_ISSUE_TYPES = ["Story", "Spike", "Bug", "Hotfix"]
-        MAX_SUMMARY_LEN = 80
-        MAX_TIMELINE_MESSAGES = 10
-        def extract_json_from_llm_output(content):
-            import json
-            try:
-                return json.loads(content)
-            except Exception:
-                match = re.search(r'\{[\s\S]*\}', content)
-                if match:
-                    try:
-                        return json.loads(match.group(0))
-                    except Exception as e:
-                        logging.warning(f"Failed to parse extracted JSON: {e}")
-                logging.warning("LLM output could not be parsed as JSON. Raw output: %s", content)
-                return {}
-        def filter_thread_history(thread_history, current_channel=None, current_thread_ts=None):
-            filtered = []
-            for msg in thread_history or []:
-                if current_thread_ts and msg.get("thread_ts") != current_thread_ts:
-                    continue
-                if msg.get("bot_id") and "Product Manager" not in msg.get("text", ""):
-                    continue
-                filtered.append(msg)
-            return filtered
-        filtered_thread_history = filter_thread_history(thread_history, channel, thread_ts)
-        logging.info(f"Filtered thread history for LLM: {filtered_thread_history}")
-        def get_ticket_type_and_summary():
+
+        def get_ticket_type_and_summary(question):
+            # Build conversation timeline with timestamps for context
             timeline = []
-            if filtered_thread_history:
-                for msg in filtered_thread_history:
+            if thread_history:
+                for msg in thread_history:
                     user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
                         timeline.append(f"[{ts}] {user}: {text}")
             timeline_str = "\n".join(timeline)
+            
             logging.info(f"Timeline sent to LLM for ticket creation:\n{timeline_str}")
-            llm_prompt = (
-                "You must respond ONLY with a valid JSON object.\n"
-                "You are a Product Manager.\n"
-                "Given the following conversation, classify the ticket as one of: Story, Spike, Bug, Hotfix.\n"
-                "Generate a JIRA-ready summary (one short, action-oriented, title-style sentence, max 80 chars) and a detailed description (include all relevant context, steps, and expected behavior).\n"
-                "IMPORTANT: The summary and description must be based on the technical details, troubleshooting steps, and all relevant information discussed by all participants in the conversation. Do NOT focus only on the last message or only on support engineer responses. Synthesize the ticket from the entire thread.\n"
-                "When listing steps or items, use Markdown format (`- item` for bullets, `1. item` for numbered lists).\n"
-                "Respond in JSON with keys: type, summary, description.\n"
-                f"Conversation timeline:\n{timeline_str if timeline_str else ''}\n"
-                f"User request: {question}\n"
+            
+            base_prompt = self.product_manager_prompts.get('ticket_creation', '')
+            
+            # First pass: Get ticket type and initial structure
+            messages = [
+                {"role": "system", "content": "You are a Product Manager. You MUST respond with ONLY valid JSON. No explanations, no markdown, just pure JSON."},
+                {"role": "user", "content": f"{base_prompt}\n\nConversation History:\n{timeline_str}\n\nCurrent Request: {question}"}
+            ]
+            
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=1000
+                )
+                
+                result = getattr(response.choices[0].message, 'content', None)
+                logging.info(f"LLM Response for ticket creation:\n{result}")
+                if not result or not isinstance(result, str) or not result.strip():
+                    logging.error(f"LLM returned no content for ticket creation. Raw response: {response}")
+                    return {
+                        "error": "The LLM did not return a ticket. Please try again or rephrase your request."
+                    }
+                
+                # Clean the result - remove any markdown formatting or extra text
+                cleaned_result = result.strip()
+                
+                # Try to extract JSON if it's wrapped in markdown code blocks
+                if cleaned_result.startswith('```'):
+                    # Remove markdown code block formatting
+                    lines = cleaned_result.split('\n')
+                    if lines[0].startswith('```'):
+                        lines = lines[1:]  # Remove first ```
+                    if lines[-1].strip() == '```':
+                        lines = lines[:-1]  # Remove last ```
+                    cleaned_result = '\n'.join(lines).strip()
+                
+                logging.info(f"Cleaned LLM response for JSON parsing:\n{cleaned_result}")
+                
+                # Parse the JSON response
+                try:
+                    ticket_data = json.loads(cleaned_result)
+                    
+                    # Validate required fields
+                    if not isinstance(ticket_data, dict):
+                        raise ValueError("Response is not a JSON object")
+                    
+                    required_fields = ["type", "summary", "description"]
+                    for field in required_fields:
+                        if field not in ticket_data:
+                            raise ValueError(f"Missing required field: {field}")
+                    
+                    # Check if we have clarifying questions
+                    if "clarifying_questions" in ticket_data and ticket_data["clarifying_questions"]:
+                        # Before asking questions, check if answers exist in conversation history
+                        questions_to_ask = []
+                        for question in ticket_data["clarifying_questions"]:
+                            # Simple check if the answer might exist in the conversation
+                            # This could be enhanced with more sophisticated matching
+                            question_topic = re.sub(r'[^a-zA-Z0-9\s]', '', question.lower())
+                            found_in_history = any(
+                                any(word in msg.lower() for word in question_topic.split())
+                                for msg in timeline_str.split("\n")
+                            )
+                            if not found_in_history:
+                                questions_to_ask.append(question)
+                        if questions_to_ask:
+                            return {
+                                "needs_clarification": True,
+                                "questions": questions_to_ask
+                            }
+                    return ticket_data
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse LLM response as JSON: {e}")
+                    logging.error(f"Raw LLM response was: {repr(result)}")
+                    logging.error(f"Cleaned response was: {repr(cleaned_result)}")
+                    
+                    # Fallback: try to create a basic ticket from the text
+                    fallback_ticket = {
+                        "type": "Task",
+                        "summary": question[:80] if question else "Manual ticket creation needed",
+                        "description": {
+                            "Context": f"LLM returned invalid JSON. Original request: {question}",
+                            "Goal": "Please review the original request and create ticket manually",
+                            "LLM Response": cleaned_result[:500] + "..." if len(cleaned_result) > 500 else cleaned_result
+                        }
+                    }
+                    return fallback_ticket
+                except ValueError as e:
+                    logging.error(f"Invalid ticket data structure: {e}")
+                    logging.error(f"Ticket data: {ticket_data}")
+                    return {
+                        "error": f"Invalid response format from LLM: {str(e)}"
+                    }
+            except Exception as e:
+                logging.error(f"Error in LLM call: {e}")
+                return {
+                    "error": f"Failed to process ticket creation: {str(e)}"
+                }
+
+        # Get filtered thread history
+        filtered_thread_history = []
+        if thread_history:
+            filtered_thread_history = [
+                msg for msg in thread_history 
+                if not any(keyword in msg.get("text", "").lower() 
+                          for keyword in ["typing", "has joined"])
+            ]
+
+        # Process the ticket creation
+        ticket_data = get_ticket_type_and_summary(question)
+        
+        if "error" in ticket_data:
+            return f"❌ Error creating ticket: {ticket_data['error']}"
+            
+        if ticket_data.get("needs_clarification"):
+            questions = ticket_data["questions"]
+            response = "I need a bit more information to create a complete ticket:\n\n"
+            for i, question in enumerate(questions, 1):
+                response += f"{i}. {question}\n"
+            return response
+            
+        try:
+            # Prepare the description and append Slack link if available
+            description = format_description(ticket_data["description"])
+            if channel and thread_ts:
+                slack_permalink = self.build_slack_permalink(channel, thread_ts)
+                description += f"\n\nSlack conversation: {slack_permalink}"
+            # Create the JIRA ticket
+            jira_response = create_jira_ticket(
+                summary=ticket_data["summary"],
+                description=description,
+                issue_type=ticket_data["type"]
             )
-            logging.info(f"LLM prompt: {llm_prompt}")
-            import litellm
-            from ddtrace.llmobs import LLMObs
-            response = litellm.completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You must respond ONLY with a valid JSON object."},
-                    {"role": "system", "content": "You are a Product Manager."},
-                    {"role": "user", "content": llm_prompt}
-                ]
-            )
-            content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
-            if not content:
-                content = "{}"
-            # Log to LLMObs for observability
-            LLMObs.annotate(
-                input_data=[{"role": "system", "content": "You must respond ONLY with a valid JSON object."}, {"role": "system", "content": "You are a Product Manager."}, {"role": "user", "content": llm_prompt}],
-                output_data=[{"role": "assistant", "content": content}],
-                tags={"agent_role": agent_role, "model_provider": model_provider}
-            )
-            logging.info(f"Raw LLM output: {content}")
-            ticket_info = extract_json_from_llm_output(content)
-            issue_type = ticket_info.get("type", "Story")
-            if issue_type not in VALID_ISSUE_TYPES:
-                logging.warning(f"Invalid or missing issue type '{issue_type}', defaulting to 'Story'.")
-                issue_type = "Story"
-            summary = ticket_info.get("summary", "").strip()
-            if not summary:
-                summary = f"{question[:MAX_SUMMARY_LEN]}"
-                logging.warning("Summary missing from LLM, using fallback.")
-            if len(summary) > MAX_SUMMARY_LEN:
-                summary = summary[:MAX_SUMMARY_LEN-3] + "..."
-            description = ticket_info.get("description", "").strip()
-            if not description:
-                if timeline_str:
-                    description = timeline_str + f"\n\nUser request: {question}"
-                else:
-                    description = f"User request: {question}"
-                logging.warning("Description missing from LLM, using fallback.")
-            return {"type": issue_type, "summary": summary, "description": description}
-        ticket_info = get_ticket_type_and_summary()
-        issue_type = ticket_info["type"]
-        summary = ticket_info["summary"]
-        description = ticket_info["description"]
-        description = re.sub(r'^Slack conversation:.*$', '', description, flags=re.MULTILINE).strip()
-        slack_link = None
-        if channel and thread_ts:
-            slack_link = self.build_slack_permalink(channel, thread_ts)
-            logging.info(f"Slack permalink being built: {slack_link}")
-            description += f"\n\nSlack conversation: {slack_link}"
-        else:
-            description += "\n\nSlack conversation: None provided"
-        logging.info(f"[CREW] slack_link: {slack_link}")
-        logging.info(f"[CREW] Final JIRA description (before ticket creation): {description!r}")
-        jira_result = create_jira_ticket(summary, description, issue_type=issue_type)
-        if "error" in jira_result:
-            main_content = f"Failed to create JIRA ticket: {jira_result['error']}"
-            ticket_url = None
-            ticket_key = None
-        else:
-            ticket_key = jira_result.get("key")
-            ticket_url = jira_result.get("url")
-            main_content = f"Created JIRA ticket: <{ticket_url}|{ticket_key}> ({issue_type})\nSummary: {summary}\nPlease assign this ticket."
-        return format_slack_response(
-            category_emoji=category_emoji,
-            category_title=category_title,
-            main_content=admin_tag + main_content,
-            agent_role=agent_role,
-            agent_emoji=agent_emoji
-        )
+            
+            if jira_response.get("error"):
+                return f"❌ Failed to create JIRA ticket: {jira_response['error']}"
+                
+            ticket_url = jira_response.get("url", "")
+            ticket_key = jira_response.get("key", "")
+            
+            return f"✅ Created {ticket_data['type']} ticket: {ticket_key}\n{ticket_url}"
+            
+        except Exception as e:
+            logging.error(f"Error creating JIRA ticket: {e}")
+            return f"❌ Failed to create JIRA ticket: {str(e)}"
 
     def build_slack_permalink(self, channel, thread_ts):
         workspace_domain = os.getenv("SLACK_WORKSPACE_DOMAIN", "yourdomain.slack.com")
@@ -1292,6 +1337,20 @@ class Theo():
                 return True
         return False
 
+    def execute_sql_with_error_handling(self, sql_query, bi_engineer_prompts, db_engine):
+        """
+        Executes a SQL query and returns results or a formatted error message.
+        """
+        try:
+            with db_engine.connect() as conn:
+                result = conn.execute(sqlalchemy.text(sql_query))
+                # You can format the result as needed, e.g., fetchall()
+                return result.fetchall()
+        except Exception as e:
+            # Use the new sql_error_handling prompt
+            error_prompt = bi_engineer_prompts["sql_error_handling"]
+            return error_prompt.format(error_message=str(e))
+
 # Enable LLM Observability at startup
 LLMObs.enable()
 
@@ -1325,3 +1384,14 @@ def markdown_to_slack(text):
     text = re.sub(r'__(.*?)__', r'_\1_', text)
     text = re.sub(r'_(.*?)_', r'_\1_', text)
     return text
+
+def format_description(description_dict):
+    """
+    Convert a dictionary of description sections into a Markdown string for JIRA.
+    """
+    if not isinstance(description_dict, dict):
+        return str(description_dict)
+    lines = []
+    for section, content in description_dict.items():
+        lines.append(f"### {section}\n{content}\n")
+    return "\n".join(lines)
