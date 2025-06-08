@@ -1250,6 +1250,31 @@ class Theo():
                 agent_role=agent_role,
                 agent_emoji=agent_emoji
             )
+            # --- Metabase integration: append a link after every SQL code block ---
+            import urllib.parse
+            def add_metabase_links_to_sql_blocks(text):
+                # Find all SQL code blocks
+                sql_block_pattern = re.compile(r'```\n([\s\S]*?)\n```', re.MULTILINE)
+                def replacer(match):
+                    sql = match.group(1).strip()
+                    if not sql:
+                        return match.group(0)
+                    url = f"https://sunroom-rentals.metabaseapp.com/question/new?sql={urllib.parse.quote(sql)}"
+                    return f'```
+{sql}
+```
+<https://sunroom-rentals.metabaseapp.com/question/new?sql={urllib.parse.quote(sql)}|▶️ Run in Metabase>'
+                return sql_block_pattern.sub(replacer, text)
+            # Only apply to main_content, not the whole slack_message
+            if isinstance(main_content, str):
+                main_content = add_metabase_links_to_sql_blocks(main_content)
+                slack_message = format_slack_response(
+                    category_emoji=category_emoji,
+                    category_title=category_title,
+                    main_content=main_content,
+                    agent_role=agent_role,
+                    agent_emoji=agent_emoji
+                )
             print(f"[DEBUG] bi_engineer_answer Slack message: {slack_message}")
             return slack_message
         return _llm_call()
