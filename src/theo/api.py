@@ -1,10 +1,18 @@
-from fastapi import FastAPI, Request, status, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, status, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import uvicorn
 import os
 from threading import Lock
 import requests
 import asyncio
+import hmac
+import hashlib
+import json
+import threading
+import time
+from datetime import datetime, timezone
+import uuid
+from urllib.parse import unquote
 
 # Initialize tracer
 from ddtrace import tracer
@@ -532,6 +540,35 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         parent_span.set_tag("event.type", "github")
         supervisor_response = await handle_event_with_supervisor("github", payload, parent_span=parent_span)
     return JSONResponse({"message": "GitHub webhook received", "supervisor_response": supervisor_response}, status_code=status.HTTP_200_OK)
+
+@app.get("/create-metabase-question")
+async def create_metabase_question_endpoint(sql: str, title: str = None):
+    """
+    Create a Metabase question on-demand and redirect to it.
+    This endpoint is called when users click '▶️ Run in Metabase' links.
+    """
+    try:
+        from theo.tools.metabase import create_metabase_question
+        
+        # Decode the SQL if it's URL-encoded
+        decoded_sql = unquote(sql)
+        
+        # Create the Metabase question
+        question_url = create_metabase_question(decoded_sql, title)
+        
+        if question_url:
+            # Redirect to the created question
+            return RedirectResponse(url=question_url, status_code=302)
+        else:
+            # Fallback to Metabase new question page if creation fails
+            metabase_base_url = os.getenv("METABASE_BASE_URL", "https://sunroom-rentals.metabaseapp.com")
+            return RedirectResponse(url=f"{metabase_base_url}/question/new", status_code=302)
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to create Metabase question: {e}")
+        # Fallback to Metabase new question page
+        metabase_base_url = os.getenv("METABASE_BASE_URL", "https://sunroom-rentals.metabaseapp.com")
+        return RedirectResponse(url=f"{metabase_base_url}/question/new", status_code=302)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
