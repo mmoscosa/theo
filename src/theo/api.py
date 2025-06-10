@@ -430,9 +430,9 @@ async def process_slack_conversation(payload: dict, conversation_id: str, channe
                     
                     return supervisor_response
             
-            # Run with retry and timeout (reduced timeout to 45 seconds)
+            # Run with retry and timeout (documentation tasks need more time)
             supervisor_response = await with_retry(
-                lambda: timeout_wrapper(process_with_supervisor(), 45),
+                lambda: timeout_wrapper(process_with_supervisor(), 90),
                 max_retries=2,
                 conversation_id=conversation_id
             )
@@ -444,11 +444,11 @@ async def process_slack_conversation(payload: dict, conversation_id: str, channe
             
     except asyncio.TimeoutError:
         # Handle timeout specifically
-        await conversation_manager.fail_conversation(conversation_id, "Conversation timed out after 45 seconds")
+        await conversation_manager.fail_conversation(conversation_id, "Conversation timed out after 90 seconds")
         await reaction_manager.add_reaction_safe(channel, parent_ts, "internet-problems")
         
         admin_id = os.getenv("ADMIN_SLACK_USER_ID")
-        error_msg = f"Sorry, this conversation timed out after 45 seconds. <@{admin_id}> will assist you shortly!"
+        error_msg = f"Sorry, this conversation timed out after 90 seconds. <@{admin_id}> will assist you shortly!"
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, send_slack_message, channel, error_msg, parent_ts)
         
