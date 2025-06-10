@@ -482,8 +482,8 @@ async def process_slack_conversation(payload: dict, conversation_id: str, channe
 @app.post("/github/webhook")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
-    # Only handle push events to main or test branch
-    if payload.get("ref") in ["refs/heads/main", "refs/heads/PD-7618"] and "commits" in payload:
+    # Only handle push events to main, prod, or test branch
+    if payload.get("ref") in ["refs/heads/main", "refs/heads/prod"] and "commits" in payload:
         def process_github_push(payload):
             theo = Theo()
             parent_code_commits_folder_id = os.getenv("CONFLUENCE_CODE_COMMITS_FOLDER_ID", "2141782054")
