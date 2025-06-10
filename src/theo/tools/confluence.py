@@ -140,46 +140,164 @@ def get_confluence_page_by_id(page_id):
     resp.raise_for_status()
     return resp.json()
 
-def add_row_to_adr_index(page_id, new_row):
+def add_row_to_adr_index(adr_title, adr_url, status, authors, date):
     """
-    Add a new row to the ADR Index table in the given Confluence page.
-    new_row: list of HTML strings for each column (Title, Status, Date, Authors, Source)
+    Add a new row to the ADR index table in Confluence.
     """
-    page = get_confluence_page_by_id(page_id)
-    current_content = page["body"]["storage"]["value"]
-    version = page["version"]["number"] + 1
-    title = page["title"]
+    try:
+        base_url = os.getenv("CONFLUENCE_BASE_URL")
+        user = os.getenv("CONFLUENCE_ADMIN_USER")
+        api_token = os.getenv("CONFLUENCE_API_TOKEN")
+        space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+        
+        # Find the ADR index page
+        adr_index_page_id = os.getenv("CONFLUENCE_ADR_INDEX_PAGE_ID")
+        
+        if not adr_index_page_id:
+            # Try to find the ADR index page by title (try multiple possible titles)
+            search_titles = [
+                "Architecture Decision Record (ADR)",  # Singular with parentheses
+                "Architecture Decision Records",        # Plural  
+                "Architecture Decision Record",         # Singular
+                "ADR"                                  # Short form
+            ]
+            
+            search_url = f"{base_url}/rest/api/content"
+            
+            for title in search_titles:
+                params = {
+                    "spaceKey": space_key,
+                    "title": title,
+                    "expand": "body.storage,version"
+                }
+                response = requests.get(search_url, auth=(user, api_token), params=params)
+                
+                if response.status_code == 200:
+                    search_results = response.json()
+                    if search_results.get("results"):
+                        adr_index_page_id = search_results["results"][0]["id"]
+                        print(f"[DEBUG] Found ADR index page '{title}' with ID: {adr_index_page_id}")
+                        break
+                        
+            if not adr_index_page_id:
+                print("[WARNING] ADR index page not found with any of the expected titles")
+                print(f"[DEBUG] Searched for titles: {search_titles}")
+                return {"error": "ADR index page not found"}
 
-    # Find the ADR Index table (assume first <table> after 'ADR Index' heading)
-    table_pattern = re.compile(r'(<h[1-6][^>]*>[^<]*ADR Index[^<]*</h[1-6]>)(.*?<table[\s\S]*?</table>)', re.IGNORECASE)
-    match = table_pattern.search(current_content)
-    if not match:
-        raise ValueError("ADR Index table not found in the page content.")
-    table_html = match.group(2)
-
-    row_html = "<tr>" + "".join(f"<td>{cell}</td>" for cell in new_row) + "</tr>"
-    # Insert after the first <tr> (header row)
-    updated_table = re.sub(r'(<tr>.*?</tr>)', r'\g<1>' + row_html, table_html, count=1)
-
-    # Replace the old table with the updated one
-    updated_content = current_content.replace(table_html, updated_table)
-
-    # Update the page
-    base_url = os.getenv("CONFLUENCE_BASE_URL")
-    user = os.getenv("CONFLUENCE_ADMIN_USER")
-    api_token = os.getenv("CONFLUENCE_API_TOKEN")
-    data = {
-        "version": {"number": version},
-        "title": title,
-        "type": "page",
-        "body": {
-            "storage": {
-                "value": updated_content,
-                "representation": "storage"
+        if not adr_index_page_id:
+            print("[WARNING] ADR index page ID not available")
+            return {"error": "ADR index page ID not available"}
+        
+        # Get current page content
+        page_url = f"{base_url}/rest/api/content/{adr_index_page_id}?expand=body.storage,version"
+        response = requests.get(page_url, auth=(user, api_token))
+        
+        if response.status_code != 200:
+            print(f"[ERROR] Failed to get ADR index page: {response.text}")
+            return {"error": "Failed to get ADR index page"}
+        
+        page_data = response.json()
+        current_content = page_data["body"]["storage"]["value"]
+        current_version = page_data["version"]["number"]
+        page_title = page_data["title"]
+        
+        # Create new table row in Confluence storage format
+        new_row = f"""<tr>
+<td><p><a href="{adr_url}">{adr_title}</a></p></td>
+<td><p>{status}</p></td>
+<td><p>{date}</p></td>
+<td><p>{authors}</p></td>
+<td><p>🧠 Human-written</p></td>
+</tr>"""
+        
+        # Find the ADR Index table specifically and insert after its header row
+        import re
+        
+        # Step 1: Find the ADR Index section specifically
+        adr_index_section_pattern = r'(<h2[^>]*>.*?📄.*?ADR.*?Index.*?</h2>.*?<table[^>]*>.*?</table>)'
+        section_match = re.search(adr_index_section_pattern, current_content, re.DOTALL | re.IGNORECASE)
+        
+        if section_match:
+            # Step 2: Within the ADR Index section, find the header row
+            adr_index_section = section_match.group(1)
+            section_start = section_match.start()
+            
+            # Look for header row within this specific section
+            header_patterns = [
+                r'(<tr[^>]*>.*?Title.*?Status.*?Date.*?Authors.*?Source.*?</tr>)',
+                r'(<tr[^>]*>.*?Title.*?Status.*?</tr>)'
+            ]
+            
+            header_end_relative = None
+            for pattern in header_patterns:
+                header_match = re.search(pattern, adr_index_section, re.DOTALL | re.IGNORECASE)
+                if header_match:
+                    header_end_relative = header_match.end()
+                    print(f"[DEBUG] Found ADR Index header row in section")
+                    break
+            
+            if header_end_relative:
+                # Calculate absolute position in the full content
+                header_end_absolute = section_start + header_end_relative
+                
+                # Insert the new row right after the header row
+                updated_content = (
+                    current_content[:header_end_absolute] + 
+                    "\n" + new_row + 
+                    current_content[header_end_absolute:]
+                )
+                print(f"[DEBUG] Inserted ADR '{adr_title}' after ADR Index header row")
+            else:
+                print(f"[WARNING] Found ADR Index section but no header row, appending to section end")
+                section_end = section_match.end() - 8  # Before </table>
+                updated_content = (
+                    current_content[:section_end] + 
+                    new_row + "\n" +
+                    current_content[section_end:]
+                )
+        else:
+            # Fallback: Look for any header row if we can't find the specific section
+            fallback_pattern = r'(<tr[^>]*>.*?Title.*?Status.*?</tr>)'
+            fallback_match = re.search(fallback_pattern, current_content, re.DOTALL | re.IGNORECASE)
+            
+            if fallback_match:
+                header_end = fallback_match.end()
+                updated_content = (
+                    current_content[:header_end] + 
+                    "\n" + new_row + 
+                    current_content[header_end:]
+                )
+                print(f"[DEBUG] Used fallback header detection")
+            else:
+                print(f"[WARNING] Could not find any header row, appending to end")
+                updated_content = current_content + new_row
+        
+        # Update the page
+        update_data = {
+            "version": {"number": current_version + 1},
+            "title": page_title,
+            "type": "page",
+            "body": {
+                "storage": {
+                    "value": updated_content,
+                    "representation": "storage"
+                }
             }
         }
-    }
-    put_resp = requests.put(f"{base_url}/rest/api/content/{page_id}", json=data, auth=(user, api_token))
-    put_resp.raise_for_status()
-    logging.info(f"[Confluence] ADR Index updated for page {page_id}.")
-    return put_resp.json() 
+        
+        update_response = requests.put(
+            f"{base_url}/rest/api/content/{adr_index_page_id}",
+            json=update_data,
+            auth=(user, api_token)
+        )
+        
+        if update_response.status_code == 200:
+            print(f"[DEBUG] Successfully added ADR '{adr_title}' to index")
+            return {"success": True, "page_id": adr_index_page_id}
+        else:
+            print(f"[ERROR] Failed to update ADR index: {update_response.text}")
+            return {"error": "Failed to update ADR index"}
+            
+    except Exception as e:
+        print(f"[ERROR] Exception in add_row_to_adr_index: {e}")
+        return {"error": str(e)} 

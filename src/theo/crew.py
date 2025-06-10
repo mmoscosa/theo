@@ -157,8 +157,29 @@ class Theo():
                 ts_str = dt.strftime("%Y-%m-%d %H:%M") if dt else ""
             except Exception:
                 ts_str = ts or ""
-            user = msg.get("user") or msg.get("username") or ("Bot" if msg.get("bot_id") else "User")
-            timeline.append(f"[{ts_str}] {user}: {text.strip()}")
+            
+            # Get display name with better logic
+            display_name = (
+                msg.get("user_profile", {}).get("display_name") or
+                msg.get("user_profile", {}).get("real_name") or 
+                msg.get("username") or
+                msg.get("user") or
+                ("Bot" if msg.get("bot_id") else "User")
+            )
+            
+            # Handle Slack user ID format
+            if display_name and display_name.startswith("U") and len(display_name) == 11:
+                better_name = (
+                    msg.get("user_profile", {}).get("display_name") or
+                    msg.get("user_profile", {}).get("real_name") or
+                    msg.get("username")
+                )
+                if better_name:
+                    display_name = better_name
+                else:
+                    display_name = f"User_{display_name[-4:]}"
+            
+            timeline.append(f"[{ts_str}] {display_name}: {text.strip()}")
         thread_timeline = "\n".join(timeline)
         general_kb_query = question or thread_timeline
         general_knowledge = bedrock.search_general_knowledge(general_kb_query)
@@ -300,13 +321,33 @@ class Theo():
         timeline = []
         if thread_history:
             for msg in thread_history:
-                user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                # Get display name with better logic
+                display_name = (
+                    msg.get("user_profile", {}).get("display_name") or
+                    msg.get("user_profile", {}).get("real_name") or 
+                    msg.get("username") or
+                    msg.get("user") or
+                    ("bot" if msg.get("bot_id") else "unknown")
+                )
+                
+                # Handle Slack user ID format
+                if display_name and display_name.startswith("U") and len(display_name) == 11:
+                    better_name = (
+                        msg.get("user_profile", {}).get("display_name") or
+                        msg.get("user_profile", {}).get("real_name") or
+                        msg.get("username")
+                    )
+                    if better_name:
+                        display_name = better_name
+                    else:
+                        display_name = f"User_{display_name[-4:]}"
+                
                 text = msg.get("text", "").strip()
                 ts = msg.get("ts", "")
                 if text:
                     # Filter out agent signatures to prevent LLM from copying them
                     if "_Taken by" not in text:
-                        timeline.append(f"[{ts}] {user}: {text}")
+                        timeline.append(f"[{ts}] {display_name}: {text}")
         timeline_str = "\n".join(timeline) if timeline else "No timeline available."
         doc_prompt = self.technical_writer_prompts["documentation_update"] \
             .replace("{timeline}", timeline_str) \
@@ -538,13 +579,24 @@ class Theo():
         page_url = adr_result.get("adr_page_url", "")
         authors_info = adr_result.get("authors_info", "Unknown")
         
-        slack_message = (
-            f":memo: *ADR Created*\n\n"
-            f"Architecture Decision Record <{page_url}|{page_title}> has been created and added to the ADR Index.\n\n"
-            f"*Status:* Proposed\n"
-            f"*Contributors:* {authors_info}\n\n"
-            f"_Taken by :memo: Technical Writer_"
-        )
+        # Check if ADR creation failed
+        if "error" in adr_result:
+            error_msg = adr_result.get("error", "Unknown error")
+            slack_message = (
+                f":warning: *ADR Creation Failed*\n\n"
+                f"Failed to create Architecture Decision Record: {page_title}\n\n"
+                f"*Error:* {error_msg}\n\n"
+                f"Please check Confluence configuration or contact admin.\n\n"
+                f"_Attempted by :memo: Technical Writer_"
+            )
+        else:
+            slack_message = (
+                f":memo: *ADR Created*\n\n"
+                f"Architecture Decision Record <{page_url}|{page_title}> has been created and added to the ADR Index.\n\n"
+                f"*Status:* Proposed\n"
+                f"*Contributors:* {authors_info}\n\n"
+                f"_Taken by :memo: Technical Writer_"
+            )
         
         print(f"[DEBUG] adr_creation result: {slack_message}")
         datadog.log_audit_event({
@@ -958,8 +1010,11 @@ class Theo():
                 ]
             )
             answer = response['choices'][0]['message']['content'].strip().lower()
-            return answer.startswith("yes")
-        except Exception:
+            result = answer.startswith("yes")
+            print(f"[DEBUG] LLM heartbeat detection for '{question}': {result} (raw: {answer})")
+            return result
+        except Exception as e:
+            print(f"[ERROR] LLM heartbeat detection failed: {e}")
             return False
 
     def supervisor_answer(self, question, conversation_id=None, context_summary=None):
@@ -973,8 +1028,14 @@ class Theo():
         context_summary = context_summary or ""
         valid_tasks = {"support_request", "documentation_update", "adr_creation", "documentation_and_adr", "bi_report", "ticket_creation", "platform_health", "supervisor_health", "clarification_needed"}
 
+        print(f"[DEBUG] supervisor_answer called with question='{question}'")
+        
         # Heartbeat/health check interception
-        if self._is_heartbeat_question(question):
+        print(f"[DEBUG] Checking if '{question}' is a heartbeat question...")
+        is_heartbeat = self._is_heartbeat_question(question)
+        print(f"[DEBUG] Heartbeat check result: {is_heartbeat}")
+        
+        if is_heartbeat:
             heartbeat_prompt = self.supervisor_prompts["heartbeat_prompt"]
             prompt = heartbeat_prompt.replace("{user_message}", question or "")
             import litellm
@@ -1086,13 +1147,33 @@ class Theo():
             timeline = []
             if thread_history:
                 for msg in thread_history:
-                    user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                    # Get display name with better logic
+                    display_name = (
+                        msg.get("user_profile", {}).get("display_name") or
+                        msg.get("user_profile", {}).get("real_name") or 
+                        msg.get("username") or
+                        msg.get("user") or
+                        ("bot" if msg.get("bot_id") else "unknown")
+                    )
+                    
+                    # Handle Slack user ID format
+                    if display_name and display_name.startswith("U") and len(display_name) == 11:
+                        better_name = (
+                            msg.get("user_profile", {}).get("display_name") or
+                            msg.get("user_profile", {}).get("real_name") or
+                            msg.get("username")
+                        )
+                        if better_name:
+                            display_name = better_name
+                        else:
+                            display_name = f"User_{display_name[-4:]}"
+                    
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
                         # Filter out agent signatures to prevent LLM from copying them
                         if "_Taken by" not in text:
-                            timeline.append(f"[{ts}] {user}: {text}")
+                            timeline.append(f"[{ts}] {display_name}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
             # Use YAML task description for documentation update
             base_prompt = self.supervisor_prompts["routing_prompt"]
@@ -1156,11 +1237,31 @@ class Theo():
             timeline = []
             if thread_history:
                 for msg in thread_history:
-                    user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                    # Get display name with better logic
+                    display_name = (
+                        msg.get("user_profile", {}).get("display_name") or
+                        msg.get("user_profile", {}).get("real_name") or 
+                        msg.get("username") or
+                        msg.get("user") or
+                        ("bot" if msg.get("bot_id") else "unknown")
+                    )
+                    
+                    # Handle Slack user ID format
+                    if display_name and display_name.startswith("U") and len(display_name) == 11:
+                        better_name = (
+                            msg.get("user_profile", {}).get("display_name") or
+                            msg.get("user_profile", {}).get("real_name") or
+                            msg.get("username")
+                        )
+                        if better_name:
+                            display_name = better_name
+                        else:
+                            display_name = f"User_{display_name[-4:]}"
+                    
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text and "_Taken by" not in text:  # Filter out agent signatures
-                        timeline.append(f"[{ts}] {user}: {text}")
+                        timeline.append(f"[{ts}] {display_name}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
             
             if "{timeline}" in prompt:
@@ -1303,16 +1404,20 @@ class Theo():
                         # Generate title from SQL
                         title = generate_title_from_sql(code)
                         
-                        # Create lazy-loading link to our API endpoint
-                        encoded_sql = urllib.parse.quote(code)
-                        encoded_title = urllib.parse.quote(title) if title else ""
-                        
-                        # Use environment variable for the base URL, default to localhost for dev
-                        base_url = os.getenv("THEO_BASE_URL", "http://localhost:8000")
-                        metabase_link = f"{base_url}/create-metabase-question?sql={encoded_sql}&title={encoded_title}"
-                        
-                        # Return properly formatted code block + clean Metabase link
-                        return f'```\n{code}\n```\n<{metabase_link}|▶️ Run in Metabase>'
+                        # For very long SQL queries (>500 chars), just provide a generic Metabase link
+                        if len(code) > 500:
+                            metabase_base_url = os.getenv("METABASE_BASE_URL", "https://sunroom-rentals.metabaseapp.com")
+                            metabase_link = f"{metabase_base_url}/question/new"
+                            return f'```\n{code}\n```\n<{metabase_link}|▶️ Create in Metabase>'
+                        else:
+                            # For shorter queries, use the dynamic link
+                            encoded_sql = urllib.parse.quote(code)
+                            encoded_title = urllib.parse.quote(title) if title else ""
+                            
+                            # Use environment variable for the base URL, default to localhost for dev
+                            base_url = os.getenv("THEO_BASE_URL", "http://localhost:8000")
+                            metabase_link = f"{base_url}/create-metabase-question?sql={encoded_sql}&title={encoded_title}"
+                            return f'```\n{code}\n```\n<{metabase_link}|▶️ Run in Metabase>'
                     else:
                         # Not SQL, return unchanged
                         return match.group(0)
@@ -1343,13 +1448,33 @@ class Theo():
             timeline = []
             if thread_history:
                 for msg in thread_history:
-                    user = msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown")
+                    # Get display name with better logic
+                    display_name = (
+                        msg.get("user_profile", {}).get("display_name") or
+                        msg.get("user_profile", {}).get("real_name") or 
+                        msg.get("username") or
+                        msg.get("user") or
+                        ("bot" if msg.get("bot_id") else "unknown")
+                    )
+                    
+                    # Handle Slack user ID format
+                    if display_name and display_name.startswith("U") and len(display_name) == 11:
+                        better_name = (
+                            msg.get("user_profile", {}).get("display_name") or
+                            msg.get("user_profile", {}).get("real_name") or
+                            msg.get("username")
+                        )
+                        if better_name:
+                            display_name = better_name
+                        else:
+                            display_name = f"User_{display_name[-4:]}"
+                    
                     text = msg.get("text", "").strip()
                     ts = msg.get("ts", "")
                     if text:
                         # Filter out agent signatures to prevent LLM from copying them
                         if "_Taken by" not in text:
-                            timeline.append(f"[{ts}] {user}: {text}")
+                            timeline.append(f"[{ts}] {display_name}: {text}")
             timeline_str = "\n".join(timeline) if timeline else "No timeline available."
             llm_prompt = self.product_manager_prompts["main_prompt"] \
                 .replace("{question}", question or "") \
@@ -1527,43 +1652,450 @@ Generate only the search query (2-4 words):"""
         return " ".join(found_terms[:3]) if found_terms else "utility partner"
 
     def _is_asking_for_existing_metabase_questions(self, question: str) -> bool:
-        """Detect if the user is specifically asking for existing Metabase questions."""
-        question_lower = question.lower()
+        """Detect if the user is specifically asking for existing Metabase questions using LLM."""
+        import litellm
         
-        # Keywords indicating they want existing questions/dashboards
-        existing_keywords = [
-            "show me the metabase",
-            "find existing",
-            "what questions exist",
-            "what dashboards",
-            "existing queries",
-            "previous reports",
-            "already created",
-            "what's in metabase",
-            "metabase that does",
-            "metabase that shows",
-            "what is the metabase",
-            "what metabase",
-            "which metabase",
-            "find the metabase",
-            "show existing",
-            "list questions",
-            "what reports do we have",
-            "what analysis exists",
-            "similar questions"
-        ]
-        
-        result = any(keyword in question_lower for keyword in existing_keywords)
-        print(f"[DEBUG] Intent detection for '{question}': {result}")
-        if result:
-            matched_keywords = [kw for kw in existing_keywords if kw in question_lower]
-            print(f"[DEBUG] Matched keywords: {matched_keywords}")
-        
-        return result
+        try:
+            intent_prompt = f"""You are an intent classifier for a BI system. Users can either:
+
+1. **Request existing Metabase questions/dashboards** - they want to see what already exists
+2. **Request new SQL analysis** - they want you to create new queries
+
+Analyze this user request and determine their intent:
+
+User request: "{question}"
+
+Examples of requests for EXISTING Metabase questions:
+- "show me the metabase for revenue analysis"
+- "give me the metabase to see unmappings week over week"
+- "what metabase questions exist for partner data?"
+- "find existing dashboards about utility completion rates"
+- "what reports do we have for activation trends?"
+
+Examples of requests for NEW SQL analysis:
+- "analyze partner revenue trends"
+- "show me SQL for weekly activation counts"
+- "create a report on utility completion rates"
+- "generate analysis of unmapping patterns"
+- "I need data on partner performance"
+
+Response with only: "EXISTING" or "NEW" """
+
+            response = litellm.completion(
+                model=self.bi_engineer_model,
+                messages=[{
+                    "role": "user", 
+                    "content": intent_prompt
+                }],
+                max_tokens=10,
+                temperature=0.1
+            )
+            
+            intent_result = response['choices'][0]['message']['content'].strip().upper()
+            is_existing = intent_result == "EXISTING"
+            
+            print(f"[DEBUG] LLM Intent detection for '{question}': {intent_result} -> existing={is_existing}")
+            return is_existing
+            
+        except Exception as e:
+            print(f"[ERROR] LLM intent detection failed: {e}")
+            # Fallback to simple keyword detection
+            question_lower = question.lower()
+            fallback_keywords = ["metabase", "existing", "what questions", "what reports", "show me the", "give me the"]
+            result = any(keyword in question_lower for keyword in fallback_keywords)
+            print(f"[DEBUG] Fallback keyword detection for '{question}': {result}")
+            return result
 
     def _build_agent_messages(self, agent_role, question, conversation_id=None, context_summary=None, thread_history=None, config_key=None):
         # Implementation of _build_agent_messages method
         pass
+
+    def create_code_commit_from_github_push(self, commits, push_info, parent_folder_id=None):
+        """
+        Create a Confluence page documenting GitHub commits from a push event.
+        """
+        try:
+            from theo.tools.confluence import create_confluence_page
+            import html
+            
+            print(f"[DEBUG] Creating code commit documentation for {len(commits)} commits")
+            
+            # Generate title from commit message(s)
+            if len(commits) == 1:
+                # Single commit: use the commit message as title
+                title = commits[0].get("message", "").strip()
+                if not title:
+                    repo_name = push_info.get("repository", "")
+                    after_hash = push_info.get("after", "")[:8]
+                    title = f"{repo_name} - {after_hash}"
+            else:
+                # Multiple commits: use descriptive title with count
+                repo_name = push_info.get("repository", "")
+                title = f"{len(commits)} commits to {repo_name}"
+            
+            # Use the technical writer prompt to generate documentation
+            agent_role = "Technical Writer"
+            model = self.technical_writer_model
+            
+            # Build commit summaries
+            commit_summaries = []
+            for i, commit in enumerate(commits, 1):
+                commit_hash = commit.get("id", "")[:8]
+                commit_message = commit.get("message", "")
+                commit_author = commit.get("author", {}).get("name", "Unknown")
+                commit_timestamp = commit.get("timestamp", "")
+                commit_url = commit.get("url", "")
+                diff_url = f"{commit_url}.diff" if commit_url else ""
+                
+                files_changed = len(commit.get("added", [])) + len(commit.get("modified", [])) + len(commit.get("removed", []))
+                
+                commit_summary = f"""
+**Commit {i}: {commit_hash}**
+- Message: {commit_message}
+- Author: {commit_author}
+- Timestamp: {commit_timestamp}
+- Files changed: {files_changed}
+- URL: {commit_url}
+- Diff: {diff_url}
+"""
+                commit_summaries.append(commit_summary)
+            
+            commit_summaries_str = "\n".join(commit_summaries)
+            
+            # Generate documentation using technical writer prompt
+            doc_prompt = self.technical_writer_prompts["code_commit_multiple"] \
+                .replace("{push_info}", str(push_info)) \
+                .replace("{commit_summaries}", commit_summaries_str)
+            
+            import litellm
+            from ddtrace.llmobs import LLMObs
+            
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a technical writer."},
+                        {"role": "user", "content": doc_prompt}
+                    ]
+                )
+                doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                
+                if not doc_content:
+                    doc_content = f"Code commit documentation for {title}"
+                
+                LLMObs.annotate(
+                    input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": doc_prompt}],
+                    output_data=[{"role": "assistant", "content": doc_content}],
+                    tags={"agent_role": agent_role, "action": "code_commit_documentation"}
+                )
+                
+            except Exception as e:
+                print(f"[ERROR] Technical Writer LLM call failed for code commit: {e}")
+                doc_content = f"Code commit documentation for {title}\n\n{commit_summaries_str}"
+            
+            # Create Confluence page
+            space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+            confluence_response = create_confluence_page(
+                title, 
+                doc_content, 
+                space_key=space_key,
+                parent_id=parent_folder_id
+            )
+            
+            print(f"[DEBUG] Created code commit page: {confluence_response}")
+            return confluence_response
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to create code commit documentation: {e}")
+            return {"error": str(e)}
+
+    def update_tbikb_for_model_changes(self, model_changes, push_info, push_date=None):
+        """
+        Update TBIKB (Technical Business Intelligence Knowledge Base) for model changes.
+        """
+        try:
+            from theo.tools.confluence import create_confluence_page
+            import html
+            
+            print(f"[DEBUG] Updating TBIKB for {len(model_changes)} model changes")
+            
+            # Generate title
+            repo_name = push_info.get("repository", "")
+            title = f"DB Schema Changes: {repo_name} - {push_date or 'Recent'}"
+            
+            # Build model changes summary
+            summary_str = ""
+            for change in model_changes:
+                file_path = change.get("path", "")
+                commit_hash = change.get("commit_hash", "")[:8]
+                commit_message = change.get("commit_message", "")
+                diff_url = change.get("diff_url", "")
+                
+                summary_str += f"""
+**File: {file_path}**
+- Commit: {commit_hash}
+- Message: {commit_message}
+- Diff: {diff_url}
+
+"""
+            
+            # Generate documentation using technical writer prompt
+            doc_prompt = self.technical_writer_prompts["db_schema_changes"] \
+                .replace("{commit_info}", str(push_info)) \
+                .replace("{summary_str}", summary_str)
+            
+            import litellm
+            from ddtrace.llmobs import LLMObs
+            
+            try:
+                response = litellm.completion(
+                    model=self.technical_writer_model,
+                    messages=[
+                        {"role": "system", "content": "You are a technical writer."},
+                        {"role": "user", "content": doc_prompt}
+                    ]
+                )
+                doc_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                
+                if not doc_content:
+                    doc_content = f"Database schema changes for {title}\n\n{summary_str}"
+                
+                LLMObs.annotate(
+                    input_data=[{"role": "system", "content": "You are a technical writer."}, {"role": "user", "content": doc_prompt}],
+                    output_data=[{"role": "assistant", "content": doc_content}],
+                    tags={"agent_role": "Technical Writer", "action": "db_schema_documentation"}
+                )
+                
+            except Exception as e:
+                print(f"[ERROR] Technical Writer LLM call failed for DB schema: {e}")
+                doc_content = f"Database schema changes for {title}\n\n{summary_str}"
+            
+            # Create TBIKB page
+            space_key = os.getenv("CONFLUENCE_SPACE_KEY_TBIKB", "TBIKB")
+            confluence_response = create_confluence_page(
+                title, 
+                doc_content, 
+                space_key=space_key
+            )
+            
+            print(f"[DEBUG] Created TBIKB page: {confluence_response}")
+            return confluence_response
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to update TBIKB: {e}")
+            return {"error": str(e)}
+
+    def _is_schema_change(self, diff_text):
+        """
+        Analyze diff text to determine if it contains schema changes.
+        """
+        schema_indicators = [
+            "@Column", "@ManyToOne", "@OneToMany", "@Entity", "@Table",
+            "export interface", "export class", "export enum",
+            "extends BaseEntity", "extends Entity",
+            "database", "schema", "migration", "model"
+        ]
+        
+        return any(indicator in diff_text for indicator in schema_indicators)
+
+    def create_adr_from_conversation(self, question=None, conversation_id=None, context_summary=None, thread_history=None, **kwargs):
+        """
+        Create an Architecture Decision Record (ADR) from a conversation.
+        """
+        try:
+            from theo.tools.confluence import create_confluence_page, add_row_to_adr_index
+            import html
+            from datetime import datetime
+            
+            print(f"[DEBUG] Creating ADR from conversation: {conversation_id}")
+            
+            # Extract timeline from thread history
+            timeline = []
+            authors = set()
+            if thread_history:
+                for msg in thread_history:
+                    # Try to get display name, fallback to user ID
+                    display_name = (
+                        msg.get("user_profile", {}).get("display_name") or
+                        msg.get("user_profile", {}).get("real_name") or 
+                        msg.get("username") or
+                        msg.get("user") or
+                        ("bot" if msg.get("bot_id") else "unknown")
+                    )
+                    
+                    # For user ID format (starts with U), try to get a better name
+                    if display_name and display_name.startswith("U") and len(display_name) == 11:
+                        # This is a Slack user ID, try to get better name from other fields
+                        better_name = (
+                            msg.get("user_profile", {}).get("display_name") or
+                            msg.get("user_profile", {}).get("real_name") or
+                            msg.get("username")
+                        )
+                        if better_name:
+                            display_name = better_name
+                        else:
+                            # Try to get user info from Slack API
+                            try:
+                                from theo.tools.slack import get_slack_user_info
+                                better_name = get_slack_user_info(display_name)
+                                if better_name and better_name != display_name:
+                                    display_name = better_name
+                                else:
+                                    display_name = f"User_{display_name[-4:]}"
+                            except Exception as e:
+                                print(f"[DEBUG] Could not get Slack user info for {display_name}: {e}")
+                                display_name = f"User_{display_name[-4:]}"
+                    
+                    if display_name != "bot" and "bot" not in display_name.lower():
+                        authors.add(display_name)
+                    text = msg.get("text", "").strip()
+                    ts = msg.get("ts", "")
+                    if text and "_Taken by" not in text:
+                        timeline.append(f"[{ts}] {display_name}: {text}")
+            
+            timeline_str = "\n".join(timeline) if timeline else "No timeline available."
+            authors_info = ", ".join(authors) if authors else "Unknown"
+            
+            # Generate ADR content using LLM
+            adr_prompt = f"""You are a technical writer creating an Architecture Decision Record (ADR).
+
+CRITICAL INSTRUCTION: Generate ONLY the ADR content itself. Do NOT include any conversational responses, introductions, or explanations like "Here's an ADR..." or "Okay, here's an ADR based on...". Start directly with the ADR title.
+
+Based on this conversation, create a comprehensive ADR following this structure:
+
+# ADR: [Decision Title]
+
+## Status
+Proposed
+
+## Context
+[What is the issue that we're seeing that is motivating this decision or change?]
+
+## Decision
+[What is the change that we're proposing and/or doing?]
+
+## Consequences
+[What becomes easier or more difficult to do because of this change?]
+
+## Implementation Notes
+[Any specific implementation details, timelines, or considerations]
+
+Conversation context:
+{context_summary or ""}
+
+Conversation timeline:
+{timeline_str}
+
+User question/request: {question or ""}
+
+Generate ONLY the ADR content - start directly with the title heading. Do NOT include any conversational text or explanations."""
+
+            model = self.technical_writer_model
+            import litellm
+            from ddtrace.llmobs import LLMObs
+            
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a technical writer specializing in Architecture Decision Records."},
+                        {"role": "user", "content": adr_prompt}
+                    ]
+                )
+                adr_content = response['choices'][0]['message']['content'] if response and 'choices' in response else None
+                
+                if not adr_content:
+                    adr_content = f"# ADR: {question or 'New Decision'}\n\n## Status\nProposed\n\n## Context\n{context_summary or 'Context not available'}"
+                
+                LLMObs.annotate(
+                    input_data=[{"role": "system", "content": "You are a technical writer specializing in Architecture Decision Records."}, {"role": "user", "content": adr_prompt}],
+                    output_data=[{"role": "assistant", "content": adr_content}],
+                    tags={"agent_role": "Technical Writer", "action": "adr_creation"}
+                )
+                
+            except Exception as e:
+                print(f"[ERROR] Technical Writer LLM call failed for ADR: {e}")
+                adr_content = f"# ADR: {question or 'New Decision'}\n\n## Status\nProposed\n\n## Context\n{context_summary or 'Context not available'}"
+            
+            # Extract title from ADR content
+            import re
+            title_match = re.search(r'# ADR[-\s]*\d*:?\s*(.+)', adr_content)
+            if title_match:
+                adr_title = title_match.group(1).strip()
+            else:
+                adr_title = question or 'New ADR'
+            
+            # Create ADR page in UP space under ADR parent folder
+            adr_parent_page_id = os.getenv("CONFLUENCE_ADR_PARENT_PAGE_ID")
+            space_key = os.getenv("CONFLUENCE_SPACE_KEY_UP", "UP")
+            
+            try:
+                confluence_response = create_confluence_page(
+                    f"ADR: {adr_title}", 
+                    adr_content, 
+                    space_key=space_key,
+                    parent_id=adr_parent_page_id
+                )
+                
+                # Check if Confluence page creation was successful
+                if "error" in confluence_response or not confluence_response.get("id"):
+                    error_msg = confluence_response.get("error", "Unknown Confluence error")
+                    print(f"[ERROR] ADR creation failed: {error_msg}")
+                    return {
+                        "adr_title": adr_title,
+                        "adr_page_url": "",
+                        "adr_content": f"❌ **ADR Creation Failed**\n\nError: {error_msg}\n\nPlease check Confluence configuration or contact admin.",
+                        "authors_info": authors_info,
+                        "error": error_msg
+                    }
+                    
+            except Exception as confluence_error:
+                error_msg = str(confluence_error)
+                print(f"[ERROR] ADR Confluence creation exception: {error_msg}")
+                return {
+                    "adr_title": adr_title,
+                    "adr_page_url": "",
+                    "adr_content": f"❌ **ADR Creation Failed**\n\nConfluence Error: {error_msg}\n\nThe ADR parent page (CONFLUENCE_ADR_PARENT_PAGE_ID={adr_parent_page_id}) may not exist or you may not have permissions. Please contact admin.",
+                    "authors_info": authors_info,
+                    "error": error_msg
+                }
+            
+            # Build ADR page URL
+            page_id = confluence_response.get("id")
+            base_url = os.getenv("CONFLUENCE_BASE_URL")
+            adr_page_url = f"{base_url}/pages/viewpage.action?pageId={page_id}" if page_id and base_url else ""
+            
+            # Add to ADR index
+            try:
+                add_row_to_adr_index(
+                    adr_title=adr_title,
+                    adr_url=adr_page_url,
+                    status="Proposed",
+                    authors=authors_info,
+                    date=datetime.now().strftime("%Y-%m-%d")
+                )
+            except Exception as e:
+                print(f"[ERROR] Failed to add ADR to index: {e}")
+            
+            print(f"[DEBUG] Created ADR: {adr_title} at {adr_page_url}")
+            
+            return {
+                "adr_title": adr_title,
+                "adr_page_url": adr_page_url,
+                "adr_content": adr_content,
+                "authors_info": authors_info,
+                "confluence_response": confluence_response
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to create ADR: {e}")
+            return {
+                "adr_title": question or "New ADR",
+                "adr_page_url": "",
+                "adr_content": f"Error creating ADR: {str(e)}",
+                "authors_info": "Unknown",
+                "error": str(e)
+            }
 
 def convert_markdown_to_slack(text):
     """
